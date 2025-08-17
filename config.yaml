@@ -1,0 +1,26 @@
+risk:
+  daily_loss_limit_pct: 0.02
+  per_trade_risk_pct: 0.01
+engine:
+  poll_seconds: 60
+  trade_window:
+    start_minutes_after_open: 5
+    end_minutes_before_close: 5
+universe:
+  watchlist_file: watchlists/symbols.txt
+  fallback_symbols: ["AAPL","MSFT","NVDA","TSLA","AMD","META","AMZN","GOOGL","NFLX","SPY"]
+budgets:
+  momentum_bucket_usd: 3000
+  momentum_max_positions: 3
+  value_bucket_usd: 17000
+  value_max_positions: 8
+momentum_rules:
+  lookback_minutes: 120
+  min_intraday_change_pct: 5.0
+  vol_spike_ratio: 2.0
+  trail_stop_pct: 2.0
+value_rules:
+  max_market_cap_usd: 5000000000
+  max_per_vs_group: 0.7
+  min_eps_growth: 0.10
+  rsi_entry_threshold: 40

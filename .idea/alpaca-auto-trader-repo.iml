@@ -1,10 +1,18 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <module type="JAVA_MODULE" version="4">
-  <component name="NewModuleRootManager" inherit-compiler-output="true">
+  <component name="FacetManager">
+    <facet type="Python" name="Python">
+      <configuration sdkName="Python 3.10 (trade)" />
+    </facet>
+  </component>
+  <component name="NewModuleRootManager">
+    <output url="file://$MODULE_DIR$/out/production/alpaca-auto-trader-repo" />
+    <output-test url="file://$MODULE_DIR$/out/test/alpaca-auto-trader-repo" />
     <exclude-output />
     <content url="file://$MODULE_DIR$" />
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />
+    <orderEntry type="library" name="Python 3.10 (trade) interpreter library" level="application" />
   </component>
   <component name="TemplatesService">
     <option name="TEMPLATE_FOLDERS">

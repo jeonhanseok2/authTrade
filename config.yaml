@@ -1,26 +1,48 @@
 risk:
   daily_loss_limit_pct: 0.02
   per_trade_risk_pct: 0.01
+  stop_loss_pct: 0.05            # 기본 손절 -5%
+  take_profit_pct: 0.10          # 1차 익절 +10%
+  trail_after_profit_pct: 0.10   # +10% 도달 시 트레일링 가동
+  trailing_stop_pct: 0.02        # 트레일링 스탑 2%
+
 engine:
   poll_seconds: 60
   trade_window:
     start_minutes_after_open: 5
     end_minutes_before_close: 5
+  skip_calls_when_market_closed: true   # ✅ 휴장 스킵 스위치
+
+notify:
+  telegram:
+    enabled: true
+  gpt:
+    enabled: true
+
 universe:
   watchlist_file: watchlists/symbols.txt
   fallback_symbols: ["AAPL","MSFT","NVDA","TSLA","AMD","META","AMZN","GOOGL","NFLX","SPY"]
+
 budgets:
-  momentum_bucket_usd: 3000
+  momentum_bucket_usd: 3000000    # 급등주 총 300 (만원 환산시 내부에서 USD로 계산)
   momentum_max_positions: 3
-  value_bucket_usd: 17000
+  value_bucket_usd: 17000000      # 저평가/스윙 버킷
   value_max_positions: 8
+
 momentum_rules:
   lookback_minutes: 120
   min_intraday_change_pct: 5.0
   vol_spike_ratio: 2.0
-  trail_stop_pct: 2.0
+  min_price_usd: 3.0
+
 value_rules:
-  max_market_cap_usd: 5000000000
-  max_per_vs_group: 0.7
-  min_eps_growth: 0.10
+  max_market_cap_usd: 5000000000     # < $5B
+  max_per_vs_group: 0.7              # PER < 그룹 중앙값 * 0.7
+  min_eps_growth: 0.10               # EPS 성장 > 10%
+  min_liquidity_usd: 1000000         # 일평균 거래대금 최소
   rsi_entry_threshold: 40
+
+news:
+  use_alpaca_news: true
+  positive_keywords: ["beat","approval","partnership","guidance raise","contract","award","upgrade","FDA","acquisition"]
+  hold_extension_days: 10            # 긍정 이슈면 보유기간 연장(스윙→장기)

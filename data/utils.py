@@ -1,7 +1,7 @@
 import pandas as pd
 
 def normalize_df(df: pd.DataFrame):
-    if df is None: 
+    if df is None:
         return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"]).set_index("timestamp")
     if "timestamp" in df.columns:
         return df.set_index("timestamp")

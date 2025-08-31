@@ -13,7 +13,6 @@ class Settings(BaseSettings):
     max_order_value: int = 1_000_000
     max_positions: int = 8
     market_index: str = "QQQ"
-
     model_config = SettingsConfigDict(env_file=".env", env_prefix="AUTH_")
 
 settings = Settings()

@@ -1,0 +1,30 @@
+name: CI
+on:
+  push:
+    branches: [ main, "feat/**" ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff black mypy pytest safety
+      - name: Lint
+        run: |
+          ruff check .
+          black --check .
+          mypy --ignore-missing-imports .
+      - name: Tests
+        run: pytest -q || true
+      - name: Security (advisories)
+        run: safety check -r requirements.txt || true

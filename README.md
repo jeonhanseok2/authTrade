@@ -13,3 +13,4 @@ pip install -r requirements.txt
 cp .env.paper.example .env.paper  # fill API keys
 MODE=paper python main.py --minutes 600 --loop
 ```
+# authTrade

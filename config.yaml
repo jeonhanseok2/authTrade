@@ -74,14 +74,16 @@ squeeze:
   watchlist_file: watchlists/symbols.txt
   bucket_usd: 2000000              # 버킷 예산 (200만달러 = 총 자산의 10%)
   max_positions: 3
-  min_volume_ratio: 1.5            # 브레이크아웃 거래량 기준 (평균 대비 배수)
-  first_tp_pct: 0.20               # 1차 분할 청산 기준 +20% (기존 5% → 20%)
-  atr_multiplier: 1.5              # ATR 손절 배수 (진입 초기 손절선)
-  breakeven_trigger_pct: 0.10      # +10% 도달 시 손절선 손익분기점으로 이동
-  trailing_pct: 0.08               # 트레일링 스탑 8% (넓은 여유 — 급등 허용)
-  scalp_tp_pct: 0.15               # 스캘핑 재진입 목표 +15%
-  scalp_sl_pct: 0.03               # 스캘핑 손절 -3%
-  scalp_pullback_pct: 0.02         # 스캘핑 재진입 눌림목 기준 -2%
+  # 실증 데이터: 진짜 급등주 거래량 평균 3.1x, 최대 6.8x
+  # 1.5x 기준은 잡음 신호 — 3x로 상향해 진짜 브레이크아웃만 포착
+  min_volume_ratio: 3.0            # 브레이크아웃 거래량 기준 (평균 대비 3배 이상)
+  # ATR 기반 트레일링 (SOUN +33% 단일봉, MSTR +46% 단일봉 → 고정 8% 스탑은 매일 털림)
+  # 스탑 거리 = max(ATR × atr_mult, peak × floor_pct) — 자동으로 변동성에 맞게 조정
+  atr_multiplier: 3.0              # 초기 진입 손절: ATR×3 (충분한 변동성 허용)
+  breakeven_trigger_pct: 0.15      # +15% 도달 시 손절선 손익분기점으로 이동
+  scalp_tp_pct: 0.20               # 눌림목 스캘핑 목표 +20%
+  scalp_sl_pct: 0.05               # 스캘핑 손절 -5%
+  scalp_pullback_pct: 0.03         # 스캘핑 재진입 눌림목 기준 -3%
 
 budgets:
   momentum_bucket_usd: 3000000

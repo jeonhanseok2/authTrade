@@ -33,21 +33,45 @@ from strategy.signals import compute_indicators, is_squeeze_fired, latest_rsi
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 계단식 트레일링 스탑 테이블
+# 실제 급등주 데이터 기반 트레일링 파라미터
 #
-# 수익 구간이 올라갈수록 스탑 간격을 좁혀서
-# 큰 상승은 끝까지 따라가고, 고점 근처에서 빠르게 보호
+# 실증 데이터 (2024~2025 급등주 분석):
+#   SOUN  +376% (36일)  단일봉 최대 +33%
+#   DJT   +324% (26일)  단일봉 최대 +35%  갭업 최대 +31%
+#   MSTR  +191% (36일)  단일봉 최대 +46%
+#   BBAI  +188% (20일)  단일봉 최대 +43%
+#   HIMS  +173% (31일)  단일봉 최대 +26%
 #
-# 예: +100% 급등 후 -5% 하락 시 청산 → 수익 +95% (거의 고점 탈출)
+# 핵심 인사이트:
+#   1. 평균 급등 규모 191%, 중위수 181% — "1.5배" 가정은 과소평가
+#   2. 고점 도달까지 평균 23일 — 당일 스캘핑이 아닌 포지션 트레이딩
+#   3. 단일봉 최대 범위 33~46% — 고정 8% 트레일링은 매일 털림
+#   4. ATR 기반 동적 스탑이 필수 (일별 변동성에 맞게 자동 조정)
+#   5. 진짜 급등 거래량: 평균 3.1x, 최대 6.8x — 1.5x 기준은 잡음 신호
+#
+# ATR 기반 트레일링:
+#   스탑 거리 = max(현재 ATR × atr_mult, 최소고정% × 고점가)
+#   수익이 커질수록 atr_mult를 줄여 고점 근처에서 더 빨리 청산
 # ─────────────────────────────────────────────────────────────────────
+
+# 수익 구간별 ATR 배수 (클수록 스탑 멀어짐 — 큰 움직임 허용)
+TIERED_ATR_MULT = [
+    # (min_profit_pct, atr_mult, min_trail_floor_pct)
+    # 수익 구간    ATR배수  최소트레일  설명
+    (0.00,  3.0, 0.12),  # 0~30%:   ATR×3  최소12%  — 초기 진입 변동성 허용
+    (0.30,  2.5, 0.10),  # 30~80%:  ATR×2.5 최소10% — 추세 진행 구간
+    (0.80,  2.0, 0.08),  # 80~150%: ATR×2   최소8%  — 가속 구간
+    (1.50,  1.5, 0.06),  # 150~300%:ATR×1.5 최소6%  — 극단 급등 구간
+    (3.00,  1.2, 0.05),  # 300%+:   ATR×1.2 최소5%  — 역사적 급등 구간
+]
+
+# 하위 호환성 유지 (ATR 없을 때 폴백용 고정 비율)
 TIERED_TRAILING = [
-    # (min_profit_pct, trailing_pct)
-    # 수익 구간      트레일링 간격  설명
-    (0.00,  0.10),  # 0~30%:    10% 여유  — 초기 변동성 허용
-    (0.30,  0.08),  # 30~60%:    8% 여유  — 추세 안정 구간
-    (0.60,  0.06),  # 60~100%:   6% 여유  — 가속 구간
-    (1.00,  0.05),  # 100~200%:  5% 여유  — 극단 급등 구간
-    (2.00,  0.04),  # 200%+:     4% 여유  — 300% 급등도 거의 고점 청산
+    (0.00,  0.12),
+    (0.30,  0.10),
+    (0.80,  0.08),
+    (1.50,  0.06),
+    (3.00,  0.05),
 ]
 
 
@@ -79,11 +103,17 @@ class SqueezePosition:
 def compute_trailing_stop(
     entry_price:    float,
     peak_price:     float,
-    current_stop:   float = 0.0,  # 현재 설정된 손절가 (0이면 최초 계산)
+    current_stop:   float = 0.0,
+    atr:            float = 0.0,   # ATR값 제공 시 ATR 기반 스탑 사용 (더 정확)
 ) -> float:
     """
-    계단식 트레일링 손절가 계산.
-    손절가는 단방향 상승만 허용 (내려가지 않음).
+    ATR 기반 계단식 트레일링 손절가 계산.
+    손절가는 단방향 상승만 허용 (래칫 메커니즘).
+
+    실증 근거:
+      SOUN 하루 변동성 33% → ATR×3 = ~30% 스탑 거리 필요
+      고정 8% 스탑이었으면 36일 동안 매일 털렸을 것
+      ATR 기반으로 해야 주식 특성에 맞게 자동 조정됨
 
     Returns:
         new_stop: float — 업데이트된 동적 손절가
@@ -91,20 +121,37 @@ def compute_trailing_stop(
     if entry_price <= 0 or peak_price <= 0:
         return current_stop
 
-    pnl_pct = (peak_price - entry_price) / entry_price  # 고점 기준 수익률
+    pnl_pct = (peak_price - entry_price) / entry_price
 
-    # 수익 구간에 맞는 트레일링 간격 선택 (가장 큰 min_profit부터 역순 탐색)
-    trail_pct = TIERED_TRAILING[0][1]  # 기본값: 10%
-    for min_profit, trail in reversed(TIERED_TRAILING):
-        if pnl_pct >= min_profit:
-            trail_pct = trail
-            break
+    if atr > 0:
+        # ATR 기반 스탑 (권장)
+        atr_mult = TIERED_ATR_MULT[0][1]
+        floor_pct = TIERED_ATR_MULT[0][2]
+        for min_profit, mult, flr in reversed(TIERED_ATR_MULT):
+            if pnl_pct >= min_profit:
+                atr_mult  = mult
+                floor_pct = flr
+                break
+        # 스탑 거리 = max(ATR × 배수, 최소 고정 비율)
+        atr_distance  = atr * atr_mult
+        floor_distance = peak_price * floor_pct
+        stop_distance  = max(atr_distance, floor_distance)
+        new_stop = peak_price - stop_distance
+    else:
+        # ATR 없을 때 고정 비율 폴백
+        trail_pct = TIERED_TRAILING[0][1]
+        for min_profit, trail in reversed(TIERED_TRAILING):
+            if pnl_pct >= min_profit:
+                trail_pct = trail
+                break
+        new_stop = peak_price * (1.0 - trail_pct)
 
-    # 새 손절가 = 고점 × (1 - 트레일링 간격)
-    new_stop = peak_price * (1.0 - trail_pct)
+    # 최소: 진입가 대비 -10% 이하로는 안 내려감 (초기 최대 손실 제한)
+    hard_floor = entry_price * 0.90
+    new_stop   = max(new_stop, hard_floor)
 
-    # 손절가는 올라갈 수만 있음 (하락 방지 — 래칫 메커니즘)
-    return max(new_stop, current_stop, entry_price * 0.93)  # 최소 -7% 아래는 안 내려감
+    # 래칫: 손절가는 올라갈 수만 있음
+    return max(new_stop, current_stop)
 
 
 def is_trailing_stop_hit(current_price: float, dynamic_stop: float) -> tuple[bool, str]:
@@ -329,10 +376,10 @@ def squeeze_hold_or_exit(
     Returns:
         (should_exit: bool, reason: str, new_dynamic_stop: float)
     """
-    # ── 동적 손절가 업데이트 ─────────────────────────────────────────
-    new_stop = compute_trailing_stop(entry_price, peak_price, dynamic_stop)
+    # ── 동적 손절가 업데이트 (ATR 반영) ─────────────────────────────
+    new_stop = compute_trailing_stop(entry_price, peak_price, dynamic_stop, atr=atr)
 
-    # ── 초기 ATR 손절 (포지션 보호 최소선) ───────────────────────────
+    # ── 초기 ATR 손절 (포지션 진입 직후 최소 보호선) ─────────────────
     if atr > 0 and dynamic_stop == 0:
         atr_stop = entry_price - atr * atr_mult
         new_stop = max(new_stop, atr_stop)

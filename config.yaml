@@ -37,10 +37,12 @@ universe:
   fallback_symbols: ["AAPL","MSFT","NVDA","TSLA","AMD","META","AMZN","GOOGL","NFLX","SPY"]
 
 # ── 버킷 1: 가치주 장기투자 ───────────────────────────────────────────
+# 초기 공격적 운용: 10% (안전망 수준만 유지)
+# 계좌 $25,000 도달 시 30%로 상향 권장
 value_long:
   watchlist_file: watchlists/value_symbols.txt
-  bucket_usd: 15000000             # 버킷 예산 (1500만달러 = 총 자산의 75%)
-  max_positions: 8                 # 최대 동시 포지션
+  bucket_pct: 0.10                 # 총 자산의 10%
+  max_positions: 2                 # 소액이라 최대 2종목으로 제한
   min_fund_score: 55.0             # 펀더멘털 최소 점수 (0~100)
   min_safety_margin_pct: 10.0      # DCF 안전마진 최소 (%)
   stop_loss_pct: 0.08              # 손절 -8%
@@ -48,10 +50,11 @@ value_long:
   rsi_entry_max: 70.0              # 진입 시 RSI 상한
 
 # ── 버킷 2: ETF 스윙/장기/단기 ──────────────────────────────────────
+# 초기 공격적 운용: 25%
 etf_swing:
   watchlist_file: watchlists/etf_symbols.txt
-  bucket_usd: 3000000              # 버킷 예산 (300만달러 = 총 자산의 15%)
-  max_positions: 4
+  bucket_pct: 0.25                 # 총 자산의 25%
+  max_positions: 2                 # 소액이라 최대 2종목으로 제한
   timeframe: auto                  # auto / short / swing / long
   short_tp_pct: 0.03               # 단기 목표 +3%
   short_sl_pct: 0.02               # 단기 손절 -2%
@@ -62,18 +65,18 @@ etf_swing:
   min_volume_ratio: 0.5            # 거래량 최소 비율 (20일 평균 대비)
 
 # ── 버킷 3: 스퀴즈 + 급등 초단타 ────────────────────────────────────
-# 급등주는 스퀴즈 발사 후 50~300% 갈 수 있음.
-# 고정 목표가 대신 분할 청산 + 트레일링으로 큰 움직임 최대한 수익화.
+# 초기 공격적 운용: 65% (핵심 성장 엔진)
+# Cash 계좌 T+1 → 하루 1종목 집중 운용
 #
 # 분할 청산 스케줄:
 #   +20% 도달 → 잔량의 25% 청산 (1차)
 #   +40% 도달 → 잔량의 33% 청산 (2차)
 #   +80% 도달 → 잔량의 50% 청산 (3차)
-#   이후       → 트레일링 8% 또는 거래량 소진 시 잔량 전량 청산
+#   이후       → ATR 트레일링으로 잔량 추적
 squeeze:
   watchlist_file: watchlists/symbols.txt
-  bucket_usd: 2000000              # 버킷 예산 (200만달러 = 총 자산의 10%)
-  max_positions: 3
+  bucket_pct: 0.65                 # 총 자산의 65%
+  max_positions: 2                 # Cash T+1: 1~2종목 집중
   # ── 프리마켓 갭업 스캐너 기준 ────────────────────────────────────
   # 실증 데이터: 진짜 급등주 갭업 평균 47%, RVOL 평균 26.7x
   min_gap_pct: 20.0                # 최소 갭업 20% (4% 이상이면 Gap&Go 후보)

@@ -56,10 +56,10 @@ def value_long_entry(
     if fs.intrinsic_value > 0 and fs.margin_of_safety < min_safety_margin:
         return False, f"DCF 안전마진 부족 ({fs.margin_of_safety:.1f}% < {min_safety_margin}%)"
 
-    # ── RSI 과매수 확인 ───────────────────────────────────────────────
+    # ── RSI 과매도 확인 — 30 미만일 때만 진입 (고점 매수 완전 차단) ───
     rsi = latest_rsi(compute_indicators(df))
-    if rsi > 70:
-        return False, f"RSI 과매수 ({rsi:.1f} > 70)"
+    if rsi > 30:
+        return False, f"RSI 과매도 미충족 ({rsi:.1f} > 30, 저점 매수 기다림)"
 
     # ── 뉴스 감성 확인 ────────────────────────────────────────────────
     articles  = fetch_articles(symbol, hours=48, limit=10)

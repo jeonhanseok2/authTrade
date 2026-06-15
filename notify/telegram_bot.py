@@ -143,6 +143,39 @@ def ask_gpt(prompt: str) -> str:
 
 # ── 텔레그램 유틸 ─────────────────────────────────────────────────────
 
+BOT_COMMANDS = [
+    {"command": "ping",       "description": "봇 상태 확인"},
+    {"command": "account",    "description": "계좌 잔고 조회"},
+    {"command": "positions",  "description": "보유 포지션 + 진입가 + 고점"},
+    {"command": "journal",    "description": "일일 매매 일지 (날짜 미입력 시 오늘)"},
+    {"command": "weekly",     "description": "주간 분석 (버킷 비중 조정 권고)"},
+    {"command": "stats",      "description": "누계 통계 (기본 30일, 예: /stats 7)"},
+    {"command": "scan",       "description": "급등/저평가 종목 스캔"},
+    {"command": "ask",        "description": "AI에게 질문 (예: /ask TSLA 지금 매수할까?)"},
+    {"command": "buy",        "description": "수동 매수 (예: /buy TSLA 5)"},
+    {"command": "sell",       "description": "수동 매도 (예: /sell TSLA 5)"},
+    {"command": "search",     "description": "종목 검색 (예: /search nvidia)"},
+    {"command": "gptstatus",  "description": "Gemini API 연결 상태 확인"},
+    {"command": "help",       "description": "명령 목록 보기"},
+    {"command": "stop",       "description": "봇 종료"},
+]
+
+
+def tg_register_commands(bot_token: str) -> bool:
+    """봇 시작 시 Telegram에 명령어 목록 등록 (앱에서 / 입력 시 자동완성)."""
+    url = f"https://api.telegram.org/bot{bot_token}/setMyCommands"
+    try:
+        r = requests.post(url, json={"commands": BOT_COMMANDS}, timeout=8)
+        if r.status_code == 200 and r.json().get("result"):
+            logging.info("Telegram 명령어 자동완성 등록 완료 (%d개)", len(BOT_COMMANDS))
+            return True
+        logging.warning("setMyCommands 실패: %s", r.text[:200])
+        return False
+    except Exception as e:
+        logging.warning("setMyCommands 오류: %s", e)
+        return False
+
+
 def tg_send(bot_token: str, chat_id: str, text: str) -> None:
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     try:
@@ -304,6 +337,9 @@ def main():
         trading_client = None
 
     ensure_asset_cache(trading_client, csv_fallback="data/assets_us_equities.csv")
+
+    # 명령어 자동완성 등록 (앱에서 / 입력 시 목록 표시)
+    tg_register_commands(bot_token)
 
     # 워커 스레드 시작 (루프 밖)
     threading.Thread(target=_worker_loop, args=(bot_token,), daemon=True).start()

@@ -46,7 +46,11 @@ from strategy.etf_swing import etf_swing_entry, etf_swing_exit, get_etf_candidat
 from strategy.squeeze import (
     squeeze_entry, squeeze_hold_or_exit, squeeze_stop_loss,
     compute_trailing_stop, scalp_reentry, scan_squeeze_candidates,
-    get_breakeven_stop,
+    get_breakeven_stop, gap_and_go_squeeze_entry,
+)
+from strategy.scanner import (
+    scan_gap_candidates, scan_short_squeeze,
+    format_scan_report, GapCandidate,
 )
 
 # 텔레그램 / GPT (실패해도 trading 중단 없음)
@@ -174,10 +178,65 @@ def _exit_squeeze(sym: str, db_pos: dict, df, current_price: float,
 
 
 # ─────────────────────────────────────────────────────────────────────
+# 프리마켓 스캔 사이클 (7:00~9:30 ET)
+#
+# 장 시작 전 갭업 후보 탐색 → 우선순위 리스트 생성
+# 장 시작 직후 one_cycle()에서 이 리스트 기반으로 Gap&Go 진입
+# ─────────────────────────────────────────────────────────────────────
+def premarket_scan(symbols: list, cfg: dict, gap_watchlist: dict) -> None:
+    """
+    프리마켓 갭업 스캐너.
+    갭업 20%+ + RVOL 5x+ + Float 50M 이하 조건 충족 종목을
+    gap_watchlist에 저장해 장 시작 후 진입에 활용.
+
+    gap_watchlist: 공유 딕셔너리 {symbol: GapCandidate}
+    """
+    sq_cfg    = cfg.get("squeeze", {})
+    min_gap   = float(sq_cfg.get("min_gap_pct",  20.0))
+    min_rvol  = float(sq_cfg.get("min_rvol",      5.0))
+
+    scan_criteria = {
+        "min_gap_pct":        min_gap,
+        "min_gap_pct_soft":   4.0,
+        "min_rvol_premarket": min_rvol,
+        "min_rvol_intraday":  10.0,
+        "max_float_ok":       50_000_000,
+    }
+
+    print(f"[SCAN] 프리마켓 스캔 시작 — {len(symbols)}개 종목")
+    candidates = scan_gap_candidates(symbols, scan_criteria, min_score=35.0)
+
+    # 숏스퀴즈 후보도 병행 스캔
+    squeeze_candidates = scan_short_squeeze(symbols, min_short_pct=15.0, min_dtc=3.0)
+
+    # gap_watchlist 업데이트
+    gap_watchlist.clear()
+    for c in candidates:
+        gap_watchlist[c.symbol] = c
+
+    if candidates:
+        report = format_scan_report(candidates)
+        print(f"[SCAN] 갭업 후보 {len(candidates)}개 발견")
+        send_telegram(report)
+    else:
+        print("[SCAN] 갭업 후보 없음")
+
+    if squeeze_candidates:
+        top_sq = squeeze_candidates[:3]
+        sq_msg = "🔥 <b>숏스퀴즈 후보</b>\n" + "\n".join(
+            f"{s['symbol']}: Short {s['short_pct']}% DTC {s['days_to_cover']}일 Float {s['float_m']}M"
+            for s in top_sq
+        )
+        print(f"[SCAN] 숏스퀴즈 후보: {[s['symbol'] for s in top_sq]}")
+        send_telegram(sq_msg)
+
+
+# ─────────────────────────────────────────────────────────────────────
 # 메인 사이클
 # ─────────────────────────────────────────────────────────────────────
 def one_cycle(broker, data_client, db: PositionDB, cfg: dict,
-              symbols: list, args, market_cache: dict) -> None:
+              symbols: list, args, market_cache: dict,
+              gap_watchlist: Optional[dict] = None) -> None:
     """
     한 사이클 실행.
     market_cache: 시장 레짐 캐시 (5분 TTL) — 반복 호출 최적화
@@ -337,16 +396,57 @@ def one_cycle(broker, data_client, db: PositionDB, cfg: dict,
     broker_pos    = broker.list_positions()
     sector_counts = db.count_open_by_sector()
 
-    # ── I-1. 버킷 3: 스퀴즈 진입 ─────────────────────────────────────
+    # 버킷 3 포지션 카운트 (I-0, I-1 공용)
+    current_sq_count = sum(1 for p in db.list_open_positions() if p["strategy"] in ("squeeze", "scalp"))
+
+    # ── I-0. 버킷 3-A: Gap&Go 진입 (프리마켓 스캐너 포착 종목) ──────
+    # 갭업 20%+ + RVOL 10x+ 조건 충족 → 장 시작 직후 5분봉 기반 진입
+    if gap_watchlist:
+        for sym, gap_cand in list(gap_watchlist.items()):
+            if current_sq_count >= sq_max:
+                break
+            if float(broker_pos.get(sym, 0.0)) > 0:
+                continue
+            df_5m = dfs.get(sym)
+            if df_5m is None or df_5m.empty or len(df_5m) < 3:
+                continue
+
+            should_enter, entry_px, stop_px, reason = gap_and_go_squeeze_entry(
+                sym, df_5m, gap_cand, regime
+            )
+            if not should_enter:
+                logging.debug("[GAP&GO] %s 패스: %s", sym, reason)
+                continue
+
+            current_price = float(df_5m["close"].iloc[-1])
+            atr           = atr_for_sizing(compute_indicators(df_5m))
+            qty           = atr_position_size(atr, equity, per_trade_risk * 1.5, current_price, 2.0)
+            if qty <= 0:
+                qty = budget_cap_size(sq_budget / max(1, sq_max), current_price)
+            if qty <= 0:
+                continue
+
+            squeeze_flag = "🔥숏스퀴즈" if gap_cand.squeeze_setup else ""
+            print(f"[GAP&GO] BUY {sym} x{qty} @ {current_price:.2f} | {reason}")
+            broker.submit_market_order(sym, qty, "buy")
+            db.open_position(sym, "squeeze", current_price, qty, "")
+            db.record_trade(sym, "buy", qty, current_price, "squeeze", reason)
+            current_sq_count += 1
+            gap_watchlist.pop(sym, None)  # 진입 완료 → 워치리스트에서 제거
+            send_telegram(
+                f"⚡ <b>GAP&GO BUY</b> {sym}{squeeze_flag} x{qty} @ {current_price:.2f}\n"
+                f"갭 {gap_cand.gap_pct:+.0f}% | RVOL {gap_cand.rvol:.0f}x | {reason}"
+            )
+
+    # ── I-1. 버킷 3-B: TTM 스퀴즈 진입 ──────────────────────────────
     sq_cfg      = cfg.get("squeeze", {})
     sq_max      = int(sq_cfg.get("max_positions", 3))
     sq_budget   = float(sq_cfg.get("bucket_usd", 2_000_000))
-    sq_vol_min  = float(sq_cfg.get("min_volume_ratio", 1.5))
+    sq_vol_min  = float(sq_cfg.get("min_volume_ratio", 3.0))
 
-    squeeze_dfs = {s: df for s, df in dfs.items() if df is not None and not df.empty}
+    squeeze_dfs   = {s: df for s, df in dfs.items() if df is not None and not df.empty}
     sq_candidates = scan_squeeze_candidates(squeeze_dfs, regime)[:sq_max]
 
-    current_sq_count = sum(1 for p in db.list_open_positions() if p["strategy"] in ("squeeze", "scalp"))
     for sym, sq_mom in sq_candidates:
         if current_sq_count >= sq_max:
             break
@@ -529,19 +629,39 @@ def main():
     # 레짐 캐시 (사이클 간 공유 — analyze_market 중복 호출 방지)
     market_cache: dict = {}
 
+    # 프리마켓 스캐너가 채우는 갭업 워치리스트 (symbol → GapCandidate)
+    gap_watchlist: dict = {}
+
     # ── 루프 ─────────────────────────────────────────────────────────
     if args.loop:
+        from zoneinfo import ZoneInfo
+        ET = ZoneInfo("America/New_York")
+        last_premarket_scan = 0.0  # 마지막 프리마켓 스캔 시각
+
         try:
             while True:
                 try:
-                    one_cycle(broker, data_client, db, cfg, symbols, args, market_cache)
+                    now_et = datetime.now(ET)
+                    hour   = now_et.hour
+                    minute = now_et.minute
+
+                    # 프리마켓 스캔: 7:00~9:25 ET, 5분마다 실행
+                    if 7 <= hour < 9 or (hour == 9 and minute < 25):
+                        if time.time() - last_premarket_scan > 300:
+                            premarket_scan(symbols + load_watchlist(
+                                cfg.get("squeeze", {}).get("watchlist_file", "watchlists/symbols.txt"), []
+                            ), cfg, gap_watchlist)
+                            last_premarket_scan = time.time()
+
+                    one_cycle(broker, data_client, db, cfg, symbols, args,
+                              market_cache, gap_watchlist)
                 except Exception as exc:
-                    logging.error("[ERROR] one_cycle 예외: %s", exc, exc_info=True)
+                    logging.error("[ERROR] 사이클 예외: %s", exc, exc_info=True)
                 time.sleep(int(cfg.get("engine", {}).get("poll_seconds", 60)))
         except KeyboardInterrupt:
             print("\n[EXIT] 사용자 중단.")
     else:
-        one_cycle(broker, data_client, db, cfg, symbols, args, market_cache)
+        one_cycle(broker, data_client, db, cfg, symbols, args, market_cache, gap_watchlist)
 
 
 if __name__ == "__main__":

@@ -74,9 +74,16 @@ squeeze:
   watchlist_file: watchlists/symbols.txt
   bucket_usd: 2000000              # 버킷 예산 (200만달러 = 총 자산의 10%)
   max_positions: 3
-  # 실증 데이터: 진짜 급등주 거래량 평균 3.1x, 최대 6.8x
-  # 1.5x 기준은 잡음 신호 — 3x로 상향해 진짜 브레이크아웃만 포착
-  min_volume_ratio: 3.0            # 브레이크아웃 거래량 기준 (평균 대비 3배 이상)
+  # ── 프리마켓 갭업 스캐너 기준 ────────────────────────────────────
+  # 실증 데이터: 진짜 급등주 갭업 평균 47%, RVOL 평균 26.7x
+  min_gap_pct: 20.0                # 최소 갭업 20% (4% 이상이면 Gap&Go 후보)
+  min_rvol: 5.0                    # 프리마켓 최소 RVOL 5x
+  min_rvol_intraday: 10.0          # 장중 진입 최소 RVOL 10x
+  max_float_m: 50.0                # 최대 Float 5000만주 (소형주 위주)
+  min_short_pct: 15.0              # 숏스퀴즈 후보 최소 숏비율 15%
+  min_days_to_cover: 3.0           # 최소 Days to Cover
+  # ── TTM 스퀴즈 (일봉/주봉) 거래량 기준 ──────────────────────────
+  min_volume_ratio: 3.0            # TTM 스퀴즈 거래량 기준 3배
   # ATR 기반 트레일링 (SOUN +33% 단일봉, MSTR +46% 단일봉 → 고정 8% 스탑은 매일 털림)
   # 스탑 거리 = max(ATR × atr_mult, peak × floor_pct) — 자동으로 변동성에 맞게 조정
   atr_multiplier: 3.0              # 초기 진입 손절: ATR×3 (충분한 변동성 허용)

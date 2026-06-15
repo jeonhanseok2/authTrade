@@ -30,6 +30,7 @@ import numpy as np
 import pandas as pd
 
 from strategy.signals import compute_indicators, is_squeeze_fired, latest_rsi
+from strategy.scanner import GapCandidate, gap_and_go_entry, vwap_entry_signal
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -288,7 +289,40 @@ def is_distribution_detected(df: pd.DataFrame, lookback_bars: int = 5) -> tuple[
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 1단계: 스퀴즈 발사 감지 및 진입 판단
+# 0단계: 갭업 급등주 Gap&Go 진입 (장 시작 직후)
+#
+# 프리마켓 스캐너가 포착한 종목을 장 시작 직후 Gap&Go로 진입.
+# TTM Squeeze와 별개로 운영되며, 더 빠른 진입 타이밍 제공.
+#
+# 진입 조건:
+#   - 갭업 20%+ (강한 카탈리스트)
+#   - RVOL 10x+ (실제 급등 평균 26.7x)
+#   - 첫 5분봉 고점 돌파 (Gap&Go 확인)
+#   - VWAP 상방 유지 (갭앤크랩 아님 확인)
+# ─────────────────────────────────────────────────────────────────────
+def gap_and_go_squeeze_entry(
+    symbol:     str,
+    df_5min:    pd.DataFrame,   # 당일 5분봉 (장 시작 후)
+    candidate,                  # GapCandidate 객체
+    regime:     str = "bull",
+) -> tuple[bool, float, float, str]:
+    """
+    갭업 후보 종목의 Gap&Go 진입 판단.
+
+    Returns:
+        (should_enter, entry_price, stop_price, reason)
+    """
+    if regime in ("bear", "panic"):
+        return False, 0.0, 0.0, f"레짐={regime}: 갭업 진입 금지"
+
+    gap_pct = getattr(candidate, "gap_pct", 0.0)
+    rvol    = getattr(candidate, "rvol",    0.0)
+
+    return gap_and_go_entry(df_5min, gap_pct, rvol)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 1단계: TTM 스퀴즈 발사 감지 및 진입 판단
 # ─────────────────────────────────────────────────────────────────────
 def squeeze_entry(
     symbol: str,

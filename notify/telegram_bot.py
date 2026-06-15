@@ -10,7 +10,6 @@ import json
 import logging
 import os
 import queue
-import random
 import signal
 import sys
 import threading
@@ -94,7 +93,7 @@ def _worker_loop(bot_token: str) -> None:
             ans = ask_gpt(prompt)
             LAST_CALL_TS = time.time()
 
-        tg_send(bot_token, chat_id, f"🤖 GPT 응답:\n{ans}")
+        tg_send(bot_token, chat_id, f"🤖 Gemini 응답:\n{ans}")
         _set_cache(chat_id, prompt, ans)
         REQ_QUEUE.task_done()
 
@@ -132,55 +131,14 @@ from alpaca.data.historical import StockHistoricalDataClient
 
 # ── OpenAI ───────────────────────────────────────────────────────────
 
-from openai import APIError, APIStatusError, OpenAI, RateLimitError
-
-_GPT_CLIENT = None
-
-
-def _get_gpt_client() -> Optional[OpenAI]:
-    global _GPT_CLIENT
-    if _GPT_CLIENT is None:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            return None
-        _GPT_CLIENT = OpenAI(api_key=api_key, timeout=20.0, max_retries=0)
-    return _GPT_CLIENT
-
-
 def ask_gpt(prompt: str) -> str:
-    client = _get_gpt_client()
-    if client is None:
-        return "GPT 호출 실패: OPENAI_API_KEY 미설정"
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    if len(prompt) > 2000:
-        prompt = prompt[:2000] + " ... (trimmed)"
-    base, max_attempts = 0.8, 5
-    for attempt in range(max_attempts):
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.5,
-                max_tokens=130,
-            )
-            return resp.choices[0].message.content.strip()
-        except RateLimitError as e:
-            body = ""
-            try:
-                body = e.response.text[:200]
-            except Exception:
-                pass
-            logging.warning("[429] rate limit. body=%s", body)
-            time.sleep(base * (2 ** attempt) + random.uniform(0, 0.7))
-        except APIStatusError as e:
-            if 500 <= e.status_code < 600:
-                logging.warning("[%s] OpenAI 서버 오류. 재시도...", e.status_code)
-                time.sleep(base * (2 ** attempt) + random.uniform(0, 0.7))
-            else:
-                return f"GPT 호출 실패: {e}"
-        except (APIError, Exception) as e:
-            time.sleep(base * (2 ** attempt) + random.uniform(0, 0.5))
-    return "GPT 호출 실패: 서버 혼잡/레이트 한도. 잠시 후 다시 시도해주세요."
+    """Gemini Flash로 질문에 답변."""
+    try:
+        from ai.gemini_helper import call_gemini, GeminiTask
+        result = call_gemini(prompt, task=GeminiTask.STOCK_ANALYSIS, max_tokens=256)
+        return result or "응답 없음 (Gemini 오류)"
+    except Exception as e:
+        return f"Gemini 호출 실패: {e}"
 
 
 # ── 텔레그램 유틸 ─────────────────────────────────────────────────────
@@ -394,17 +352,24 @@ def main():
 
             if cmd in ("/start", "/help"):
                 tg_send(bot_token, chat_id,
-                        "명령:\n"
-                        "/ping\n"
-                        "/account\n"
+                        "📋 <b>명령 목록</b>\n"
+                        "\n<b>모니터링</b>\n"
+                        "/ping — 봇 상태 확인\n"
+                        "/account — 계좌 잔고\n"
                         "/positions — 포지션 + 진입가 + 고점\n"
-                        "/scan — 급등/저평가 스캔\n"
-                        "/search 키워드\n"
+                        "\n<b>분석 · 일지</b>\n"
+                        "/journal [YYYY-MM-DD] — 일일 매매 일지 생성\n"
+                        "/weekly [YYYY-MM-DD] — 주간 분석 (해당 주 월요일)\n"
+                        "/stats [30] — 누계 통계 (기본 30일)\n"
+                        "/scan — 급등/저평가 종목 스캔\n"
+                        "/ask 질문내용 — AI에게 질문\n"
+                        "\n<b>수동 주문</b>\n"
                         "/buy TICKER QTY\n"
                         "/sell TICKER QTY\n"
-                        "/ask 질문내용\n"
-                        "/gptstatus\n"
-                        "/stop")
+                        "/search 키워드\n"
+                        "\n<b>기타</b>\n"
+                        "/gptstatus — Gemini 연결 상태\n"
+                        "/stop — 봇 종료")
                 continue
 
             if cmd == "/ping":
@@ -412,10 +377,13 @@ def main():
                 continue
 
             if cmd == "/gptstatus":
-                ok = bool(os.getenv("OPENAI_API_KEY"))
+                ok = bool(os.getenv("GEMINI_API_KEY"))
+                flash = os.getenv("GEMINI_FLASH_MODEL", "gemini-1.5-flash")
+                pro   = os.getenv("GEMINI_PRO_MODEL",   "gemini-1.5-pro")
                 tg_send(bot_token, chat_id,
-                        f"OPENAI_KEY: {'OK' if ok else 'MISSING'}\n"
-                        f"MODEL: {os.getenv('OPENAI_MODEL', 'gpt-4o-mini')}")
+                        f"GEMINI_KEY: {'OK' if ok else 'MISSING'}\n"
+                        f"Flash: {flash}\n"
+                        f"Pro:   {pro}")
                 continue
 
             if cmd == "/stop":
@@ -430,7 +398,7 @@ def main():
                 q = " ".join(rest).strip()
                 cached = _get_cached(chat_id, q)
                 if cached:
-                    tg_send(bot_token, chat_id, f"🤖 (캐시) GPT 응답:\n{cached}")
+                    tg_send(bot_token, chat_id, f"🤖 (캐시) Gemini 응답:\n{cached}")
                     continue
                 if not _allow_chat(chat_id):
                     tg_send(bot_token, chat_id, f"요청이 너무 빠릅니다. {ASK_COOLDOWN_SEC}초 뒤 다시 시도해주세요.")
@@ -485,6 +453,38 @@ def main():
                     tg_send(bot_token, chat_id, txt)
                 except Exception as e:
                     tg_send(bot_token, chat_id, f"스캔 오류: {e}")
+                continue
+
+            if cmd == "/journal":
+                target_date = rest[0] if rest else None
+                tg_send(bot_token, chat_id, "📝 일지 생성 중...")
+                try:
+                    from storage.journal import generate_and_save
+                    msg = generate_and_save(db, date=target_date, send_telegram=False)
+                    tg_send(bot_token, chat_id, msg or "일지 생성 실패")
+                except Exception as e:
+                    tg_send(bot_token, chat_id, f"일지 생성 오류: {e}")
+                continue
+
+            if cmd == "/weekly":
+                week_start = rest[0] if rest else None
+                tg_send(bot_token, chat_id, "📊 주간 분석 생성 중...")
+                try:
+                    from storage.journal import generate_weekly
+                    msg = generate_weekly(db, week_start=week_start, send_telegram=False)
+                    tg_send(bot_token, chat_id, msg or "주간 분석 실패")
+                except Exception as e:
+                    tg_send(bot_token, chat_id, f"주간 분석 오류: {e}")
+                continue
+
+            if cmd == "/stats":
+                days = int(rest[0]) if rest and rest[0].isdigit() else 30
+                try:
+                    from storage.journal import format_stats_message
+                    msg = format_stats_message(db, days=days)
+                    tg_send(bot_token, chat_id, msg)
+                except Exception as e:
+                    tg_send(bot_token, chat_id, f"통계 조회 오류: {e}")
                 continue
 
             if cmd in ("/buy", "/sell"):

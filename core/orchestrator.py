@@ -153,12 +153,33 @@ class Orchestrator:
 
     def _do_exit(self, sym: str, qty: int, price: float, reason: str, strategy: str) -> None:
         try:
+            # 청산 전 포지션 정보 조회 (closed_trades 기록용)
+            pos = self.db.get_open_position(sym)
+
             self.broker.submit_order(symbol=sym, qty=qty, side="sell", type="market")
             self.db.close_position(sym)
             self.db.record_trade(sym, "sell", qty, price, strategy, reason)
-            pnl_hint = ""
+
+            # 청산 완료 기록 (일지/통계용)
+            if pos:
+                self.db.record_closed_trade(
+                    symbol      = sym,
+                    strategy    = strategy,
+                    entry_price = float(pos["entry_price"]),
+                    exit_price  = price,
+                    qty         = qty,
+                    entry_ts    = pos["entry_ts"],
+                    exit_ts     = datetime.now(timezone.utc).isoformat(),
+                    exit_reason = reason,
+                    sector      = pos.get("sector", ""),
+                )
+                pnl = (price - float(pos["entry_price"])) * qty
+                pnl_hint = f"  PnL: {'+'if pnl>=0 else ''}${pnl:.2f}"
+            else:
+                pnl_hint = ""
+
             self._notify(f"[{strategy.upper()}] {sym} 청산: {reason} @ ${price:.2f}{pnl_hint}")
-            logging.info("[EXIT] %s 청산: %s @ $%.2f", sym, reason, price)
+            logging.info("[EXIT] %s 청산: %s @ $%.2f%s", sym, reason, price, pnl_hint)
         except Exception as exc:
             logging.error("[EXIT] %s 청산 실패: %s", sym, exc)
 
@@ -249,6 +270,7 @@ class Orchestrator:
     async def run_monitor_loop(self) -> None:
         logging.info("[MONITOR] 모니터 루프 시작 (60초 주기)")
         tick = 0
+        _journal_done_date: str = ""  # 하루 한 번만 생성
         while True:
             try:
                 await self._monitor_cycle()
@@ -257,6 +279,22 @@ class Orchestrator:
                 if tick >= 60:
                     await asyncio.to_thread(self.bucket_capital.check_and_rebalance)
                     tick = 0
+
+                # 장 마감 후 일지 자동 생성 (16:05 ET 이후, 하루 한 번)
+                from zoneinfo import ZoneInfo
+                now_et = datetime.now(ZoneInfo("America/New_York"))
+                today  = now_et.strftime("%Y-%m-%d")
+                if (now_et.hour == 16 and now_et.minute >= 5
+                        and _journal_done_date != today
+                        and now_et.weekday() < 5):  # 평일만
+                    try:
+                        from storage.journal import generate_and_save
+                        await asyncio.to_thread(generate_and_save, self.db, today, True)
+                        _journal_done_date = today
+                        logging.info("[MONITOR] 일지 자동 생성 완료: %s", today)
+                    except Exception as je:
+                        logging.warning("[MONITOR] 일지 생성 실패: %s", je)
+
             except Exception as exc:
                 logging.error("[MONITOR] 예외: %s", exc)
             await asyncio.sleep(60)

@@ -44,8 +44,9 @@ from analysis.fundamental import analyze_fundamental
 from strategy.value_long import value_long_entry, value_long_exit, scan_value_candidates
 from strategy.etf_swing import etf_swing_entry, etf_swing_exit, get_etf_candidates, ETF_UNIVERSE
 from strategy.squeeze import (
-    squeeze_entry, squeeze_partial_exit, scalp_reentry, scalp_exit,
-    squeeze_stop_loss, scan_squeeze_candidates,
+    squeeze_entry, squeeze_hold_or_exit, squeeze_stop_loss,
+    compute_trailing_stop, scalp_reentry, scan_squeeze_candidates,
+    get_breakeven_stop,
 )
 
 # 텔레그램 / GPT (실패해도 trading 중단 없음)
@@ -132,41 +133,44 @@ def _exit_etf(sym: str, db_pos: dict, current_price: float,
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 버킷 3: 스퀴즈 청산 체크
+# 버킷 3: 스퀴즈 청산 체크 — 계단식 트레일링 + 오더플로우
+#
+# 고정 익절 없음 — 매수 세력이 살아 있는 동안은 보유.
+# 계단식 트레일링 스탑으로 50~300% 급등 시 수익 극대화.
 # ─────────────────────────────────────────────────────────────────────
 def _exit_squeeze(sym: str, db_pos: dict, df, current_price: float,
                   peak_price: float, cfg: dict) -> tuple[bool, str]:
     sq_cfg      = cfg.get("squeeze", {})
     entry_price = db_pos["entry_price"]
     atr         = atr_for_sizing(df)
-    phase       = db_pos.get("notes", "entered")  # 'entered' or 'scalp'
 
-    # ATR 기반 전체 손절 (모든 단계 공통)
-    stopped, reason = squeeze_stop_loss(
-        entry_price, current_price, atr,
-        _get_cfg_float(sq_cfg, "atr_multiplier", default=1.5),
+    # 동적 손절가 복원 (DB에서 가져오거나 재계산)
+    dynamic_stop = _get_cfg_float(db_pos, "dynamic_stop", default=0.0)
+    if dynamic_stop == 0:
+        # 최초 계산: ATR 기반 초기 손절선
+        if atr > 0:
+            dynamic_stop = entry_price - atr * _get_cfg_float(sq_cfg, "atr_multiplier", default=1.5)
+
+    # 손익분기점 이동 적용 (+10% 도달 시 손절가를 진입가로 올림)
+    be_stop = get_breakeven_stop(
+        entry_price, current_price,
+        _get_cfg_float(sq_cfg, "breakeven_trigger_pct", default=0.10),
     )
-    if stopped:
-        return True, reason
+    if be_stop > dynamic_stop:
+        dynamic_stop = be_stop
 
-    if phase == "entered":
-        # 1차 익절 조건 확인
-        partial, reason = squeeze_partial_exit(
-            entry_price, current_price,
-            _get_cfg_float(sq_cfg, "first_tp_pct", default=0.05),
-        )
-        return partial, reason
+    # 계단식 트레일링 + 오더플로우 분배 감지로 청산 판단
+    should_exit, reason, new_stop = squeeze_hold_or_exit(
+        df, entry_price, current_price, peak_price,
+        dynamic_stop = dynamic_stop,
+        atr          = atr,
+        atr_mult     = _get_cfg_float(sq_cfg, "atr_multiplier", default=1.5),
+    )
 
-    elif phase == "scalp":
-        # 스캘핑 청산 조건 확인
-        return scalp_exit(
-            df, entry_price, current_price, peak_price,
-            tp_pct    = _get_cfg_float(sq_cfg, "scalp_tp_pct", default=0.03),
-            sl_pct    = _get_cfg_float(sq_cfg, "scalp_sl_pct", default=0.015),
-            trail_pct = 0.015,
-        )
+    # 동적 손절가 갱신 (DB update는 호출자에서 처리)
+    db_pos["dynamic_stop"] = new_stop
 
-    return False, ""
+    return should_exit, reason
 
 
 # ─────────────────────────────────────────────────────────────────────

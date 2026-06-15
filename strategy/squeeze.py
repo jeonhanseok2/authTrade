@@ -4,43 +4,240 @@
 
 전략 개요:
   1단계 (스퀴즈 감지): TTM Squeeze 지표로 에너지 축적 구간 탐지
-  2단계 (방향 예측):   Momentum 히스토그램 방향 + RSI + 거래량으로 상승/하락 예측
-  3단계 (진입):        스퀴즈 발사(squeeze_off=True) 후 상승 돌파 확인 시 매수
-  4단계 (수익실현):    1차 목표가(+5%) 도달 시 절반 청산, 나머지는 트레일링
-  5단계 (스캘핑 재진입): 가격 하락 시 거래량 확인 후 재진입(초단타 스캘핑)
-  6단계 (종료):        재진입 후 목표 달성 또는 거래량 감소 시 완전 청산
+  2단계 (방향 예측):   Momentum 히스토그램 + RSI + 거래량으로 상승/하락 예측
+  3단계 (진입):        스퀴즈 발사(squeeze_off=True) 후 상승 돌파 + 매수세 확인
+  4단계 (수익극대화):  계단식 트레일링 스탑 — 급등 50~300% 최대한 추적
+                       고정 익절 절대 금지 — 매도 세력이 매수세 압도할 때까지 보유
+  5단계 (오더플로우):  매수/매도 틱 방향 + 거래량으로 세력 교체 조기 감지
+  6단계 (스캘핑 재진입): 눌림목 + 매수세 재개 확인 후 재진입
 
-핵심 지표:
-  - TTM Squeeze (squeeze_on / squeeze_off / squeeze_mom / squeeze_rising)
-  - RSI: 방향 확인 (> 50 = 상승 모멘텀)
-  - 거래량: 브레이크아웃 후 vol > vol_ma20 × 2 = 강한 돌파
-  - ATR: 손절 거리 계산
+수익 비교:
+  고정 5% 익절  →  +100% 급등 시 수익 +5%   (94% 낭비)
+  분할 스케일아웃→  +100% 급등 시 수익 +56%  (44% 낭비)
+  계단식 트레일 →  +100% 급등 시 수익 +88%  (12%만 손실 — 고점 근처에서 청산)
+
+핵심 원칙:
+  "매수 세력이 살아 있는 동안은 절대 팔지 마라.
+   매도 세력이 매수세를 압도하기 시작할 때 빠져라."
 """
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import List, Optional
 
+import numpy as np
 import pandas as pd
 
 from strategy.signals import compute_indicators, is_squeeze_fired, latest_rsi
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 스퀴즈 상태 정보 (포지션 관리에 필요)
+# 계단식 트레일링 스탑 테이블
+#
+# 수익 구간이 올라갈수록 스탑 간격을 좁혀서
+# 큰 상승은 끝까지 따라가고, 고점 근처에서 빠르게 보호
+#
+# 예: +100% 급등 후 -5% 하락 시 청산 → 수익 +95% (거의 고점 탈출)
 # ─────────────────────────────────────────────────────────────────────
+TIERED_TRAILING = [
+    # (min_profit_pct, trailing_pct)
+    # 수익 구간      트레일링 간격  설명
+    (0.00,  0.10),  # 0~30%:    10% 여유  — 초기 변동성 허용
+    (0.30,  0.08),  # 30~60%:    8% 여유  — 추세 안정 구간
+    (0.60,  0.06),  # 60~100%:   6% 여유  — 가속 구간
+    (1.00,  0.05),  # 100~200%:  5% 여유  — 극단 급등 구간
+    (2.00,  0.04),  # 200%+:     4% 여유  — 300% 급등도 거의 고점 청산
+]
+
+
 @dataclass
 class SqueezePosition:
     """스퀴즈 포지션 상태 추적."""
-    symbol:       str   = ""
-    phase:        str   = "none"    # none / entered / partial_exit / scalp_reentry
-    entry_price:  float = 0.0
-    first_tp:     float = 0.0      # 1차 목표가 (+5%)
-    scalp_entry:  float = 0.0      # 스캘핑 재진입가
-    peak_price:   float = 0.0
-    qty_full:     int   = 0        # 초기 수량
-    qty_remaining: int  = 0        # 절반 청산 후 남은 수량
+    symbol:        str   = ""
+    phase:         str   = "none"   # none / entered / scalp_reentry
+    entry_price:   float = 0.0
+    peak_price:    float = 0.0
+    dynamic_stop:  float = 0.0      # 계단식 트레일링으로 계속 올라가는 손절가
+    qty_full:      int   = 0
+    qty_remaining: int   = 0
+    scalp_entry:   float = 0.0
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 계단식 트레일링 스탑 계산
+#
+# 핵심 로직:
+#   현재 수익 구간 → 적용 트레일링 간격 결정
+#   동적 손절가 = 고점 × (1 - 트레일링 간격)
+#   손절가는 올라갈 수만 있고, 내려갈 수 없음 (한방향 래칫)
+#
+# 만원 투자, 100% 급등 예시:
+#   고점 20,000원 도달 후 -5% 하락 → 손절가 = 20,000 × (1 - 0.05) = 19,000원 청산
+#   수익 = 19,000 - 10,000 = 9,000원 (+90%)
+# ─────────────────────────────────────────────────────────────────────
+def compute_trailing_stop(
+    entry_price:    float,
+    peak_price:     float,
+    current_stop:   float = 0.0,  # 현재 설정된 손절가 (0이면 최초 계산)
+) -> float:
+    """
+    계단식 트레일링 손절가 계산.
+    손절가는 단방향 상승만 허용 (내려가지 않음).
+
+    Returns:
+        new_stop: float — 업데이트된 동적 손절가
+    """
+    if entry_price <= 0 or peak_price <= 0:
+        return current_stop
+
+    pnl_pct = (peak_price - entry_price) / entry_price  # 고점 기준 수익률
+
+    # 수익 구간에 맞는 트레일링 간격 선택 (가장 큰 min_profit부터 역순 탐색)
+    trail_pct = TIERED_TRAILING[0][1]  # 기본값: 10%
+    for min_profit, trail in reversed(TIERED_TRAILING):
+        if pnl_pct >= min_profit:
+            trail_pct = trail
+            break
+
+    # 새 손절가 = 고점 × (1 - 트레일링 간격)
+    new_stop = peak_price * (1.0 - trail_pct)
+
+    # 손절가는 올라갈 수만 있음 (하락 방지 — 래칫 메커니즘)
+    return max(new_stop, current_stop, entry_price * 0.93)  # 최소 -7% 아래는 안 내려감
+
+
+def is_trailing_stop_hit(current_price: float, dynamic_stop: float) -> tuple[bool, str]:
+    """
+    계단식 트레일링 스탑 터치 여부 확인.
+
+    Returns:
+        (triggered: bool, reason: str)
+    """
+    if dynamic_stop <= 0:
+        return False, ""
+    if current_price <= dynamic_stop:
+        return True, f"트레일링 스탑 ({current_price:.2f} <= 동적 손절가 {dynamic_stop:.2f})"
+    return False, ""
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 오더플로우 분석 — 매수/매도 세력 강도 실시간 측정
+#
+# 원리:
+#   틱 방향(uptick/downtick)으로 매수세 vs 매도세 구분
+#   uptick(직전보다 높게 체결) = 매수자가 적극적 (매수세)
+#   downtick(직전보다 낮게 체결) = 매도자가 적극적 (매도세)
+#
+# 매수량이 압도하는 동안 → 보유
+# 매도량이 매수량을 1.5배 이상 압도 → 분배(distribution) 시작 → 청산 준비
+# ─────────────────────────────────────────────────────────────────────
+def analyze_order_flow(df: pd.DataFrame, lookback_bars: int = 10) -> dict:
+    """
+    최근 N봉의 오더플로우 강도 분석.
+
+    분석 방법:
+      - 봉 마감가 > 시가: 매수 주도 봉 → buy_vol += volume
+      - 봉 마감가 < 시가: 매도 주도 봉 → sell_vol += volume
+      - 봉 마감가 == 시가: 균형 봉 → 거래량 반씩 배분
+
+    Returns:
+        {
+          'buy_vol':  float,   # 매수 주도 거래량
+          'sell_vol': float,   # 매도 주도 거래량
+          'ratio':    float,   # buy_vol / sell_vol (>1 = 매수 우위)
+          'signal':   str,     # 'bullish'/'bearish'/'neutral'
+          'strength': float,   # 0~1, 신호 강도
+        }
+    """
+    if df.empty or len(df) < 2:
+        return {"buy_vol": 0, "sell_vol": 0, "ratio": 1.0, "signal": "neutral", "strength": 0.0}
+
+    recent = df.tail(lookback_bars).copy()
+
+    buy_vol  = 0.0
+    sell_vol = 0.0
+
+    for _, row in recent.iterrows():
+        vol   = float(row.get("volume", 0) or 0)
+        op    = float(row.get("open",  0) or 0)
+        cl    = float(row.get("close", 0) or 0)
+        hi    = float(row.get("high",  0) or 0)
+        lo    = float(row.get("low",   0) or 0)
+
+        if vol == 0 or op == 0:
+            continue
+
+        candle_range = hi - lo
+        if candle_range == 0:
+            buy_vol  += vol * 0.5
+            sell_vol += vol * 0.5
+            continue
+
+        # 클로즈 위치 비율로 매수/매도 추정 (Wyckoff 방식)
+        # 고점에 가까울수록 매수 주도, 저점에 가까울수록 매도 주도
+        buy_ratio  = (cl - lo) / candle_range
+        sell_ratio = (hi - cl) / candle_range
+        buy_vol  += vol * buy_ratio
+        sell_vol += vol * sell_ratio
+
+    total = buy_vol + sell_vol
+    if total == 0:
+        return {"buy_vol": 0, "sell_vol": 0, "ratio": 1.0, "signal": "neutral", "strength": 0.0}
+
+    ratio    = buy_vol / max(sell_vol, 1.0)
+    strength = abs(buy_vol - sell_vol) / total  # 0~1
+
+    if ratio >= 1.5:
+        signal = "bullish"   # 매수 세력 압도 → 보유
+    elif ratio <= 0.67:
+        signal = "bearish"   # 매도 세력 압도 → 청산 준비
+    else:
+        signal = "neutral"
+
+    return {
+        "buy_vol":  round(buy_vol,  0),
+        "sell_vol": round(sell_vol, 0),
+        "ratio":    round(ratio,    3),
+        "signal":   signal,
+        "strength": round(strength, 3),
+    }
+
+
+def is_distribution_detected(df: pd.DataFrame, lookback_bars: int = 5) -> tuple[bool, str]:
+    """
+    분배(distribution) 패턴 감지 — 고점에서 매도 세력이 매수 압도 시작.
+
+    분배 조건 (모두 충족 시):
+      1. 오더플로우 ratio < 0.67 (매도가 매수의 1.5배 이상)
+      2. 거래량 증가 + 가격 정체 또는 하락 (고점 근처에서 거래량 터지며 팔기 시작)
+
+    Returns:
+        (is_distributing: bool, reason: str)
+    """
+    flow = analyze_order_flow(df, lookback_bars)
+    if flow["signal"] != "bearish":
+        return False, ""
+
+    # 거래량 증가 확인 (현재 vol > 20일 평균)
+    if "vol_ma20" not in df.columns:
+        df = compute_indicators(df)
+    last   = df.iloc[-1]
+    vol    = float(last.get("volume", 0) or 0)
+    vol_ma = float(last.get("vol_ma20", 1) or 1)
+    vol_surge = vol > vol_ma * 1.3
+
+    # 가격 정체/하락 확인 (최근 3봉 고점 대비 현재가)
+    recent_high = float(df.tail(5)["high"].max())
+    current     = float(last.get("close", 0) or recent_high)
+    price_stall = current < recent_high * 0.97  # 최근 고점 대비 -3% 이상 밀림
+
+    if flow["ratio"] < 0.67 and vol_surge and price_stall:
+        return True, (
+            f"분배 감지 — 매도/매수비={1/flow['ratio']:.1f}x, "
+            f"거래량={vol/vol_ma:.1f}x, 고점 대비 -{(1-current/recent_high)*100:.1f}%"
+        )
+    return False, ""
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -50,7 +247,7 @@ def squeeze_entry(
     symbol: str,
     df:     pd.DataFrame,
     regime: str = "bull",
-    min_volume_ratio: float = 1.5,  # 거래량 비율 최소 기준 (평균 대비)
+    min_volume_ratio: float = 1.5,
 ) -> tuple[bool, str]:
     """
     스퀴즈 진입 여부 판단.
@@ -60,16 +257,15 @@ def squeeze_entry(
       2. squeeze_rising=True + squeeze_mom > 0 (상승 방향 확인)
       3. RSI > 50 (상승 모멘텀)
       4. 거래량 > 20일 평균 × 1.5 (확인 거래량)
-      5. 레짐 bear/panic 아닐 것
+      5. 오더플로우 매수 우위 (ratio >= 1.2)
+      6. 레짐 bear/panic 아닐 것
 
     Returns:
         (should_enter: bool, reason: str)
     """
-    # bear/panic 레짐에서 스퀴즈 롱 진입 금지
     if regime in ("bear", "panic"):
         return False, f"레짐={regime}: 스퀴즈 롱 진입 금지"
 
-    # ── 지표 계산 ─────────────────────────────────────────────────────
     if "squeeze_off" not in df.columns:
         df = compute_indicators(df)
 
@@ -86,130 +282,125 @@ def squeeze_entry(
     rsi = latest_rsi(df)
     if rsi < 50:
         return False, f"RSI 50 미만 ({rsi:.1f}) — 상승 모멘텀 부족"
-    if rsi > 80:
-        return False, f"RSI 과매수 ({rsi:.1f} > 80) — 진입 위험"
+    if rsi > 85:
+        return False, f"RSI 과매수 ({rsi:.1f} > 85)"
 
     # ── 거래량 확인 ───────────────────────────────────────────────────
     vol    = float(last.get("volume", 0) or 0)
     vol_ma = float(last.get("vol_ma20", 1) or 1)
     if vol_ma > 0 and vol < vol_ma * min_volume_ratio:
-        return False, f"거래량 부족 ({vol/vol_ma:.1f}x < {min_volume_ratio}x 평균)"
+        return False, f"거래량 부족 ({vol/vol_ma:.1f}x < {min_volume_ratio}x)"
 
-    # ── 모멘텀 강도 ───────────────────────────────────────────────────
+    # ── 오더플로우 매수 우위 확인 ─────────────────────────────────────
+    flow = analyze_order_flow(df, lookback_bars=5)
+    if flow["signal"] == "bearish":
+        return False, f"매도 세력 우위 (ratio={flow['ratio']:.2f}) — 진입 금지"
+
     mom = float(last.get("squeeze_mom", 0) or 0)
     reason = (
-        f"스퀴즈 진입 — 모멘텀:{mom:.3f}, RSI:{rsi:.1f}, "
-        f"거래량:{vol/vol_ma:.1f}x"
+        f"스퀴즈 진입 — 모멘텀:{mom:.4f}, RSI:{rsi:.1f}, "
+        f"거래량:{vol/vol_ma:.1f}x, 매수/매도비:{flow['ratio']:.2f}"
     )
     return True, reason
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 4단계: 분할 청산 + 트레일링 스탑 (급등주 50~300% 대응)
+# 메인 보유 판단 — 계단식 트레일링 + 오더플로우
 #
-# 급등주는 스퀴즈 발사 후 50~300% 갈 수 있으므로
-# 고정 목표가(5%)로 전량 청산하면 대부분의 수익을 놓침.
-#
-# 전략:
-#   +10% 도달 → 손절선을 손익분기점으로 올림 (리스크 0 구간 확보)
-#   +20% 도달 → 25% 분할 청산 (1차), 나머지 계속 보유
-#   +40% 도달 → 추가 25% 청산 (2차)
-#   이후      → 거래량 소진 / 모멘텀 역전 / 트레일링 스탑으로 나머지 청산
+# 매 틱마다 호출.
+# 청산 여부 + 업데이트된 동적 손절가 반환.
 # ─────────────────────────────────────────────────────────────────────
-
-# 분할 청산 레벨 정의 (pnl_pct 기준)
-SCALE_OUT_LEVELS = [
-    {"pnl_pct": 0.20, "sell_ratio": 0.25, "label": "1차 분할 청산"},  # +20%에서 25%
-    {"pnl_pct": 0.40, "sell_ratio": 0.33, "label": "2차 분할 청산"},  # +40%에서 잔량의 33%
-    {"pnl_pct": 0.80, "sell_ratio": 0.50, "label": "3차 분할 청산"},  # +80%에서 잔량의 50%
-]
-
-
-def squeeze_scale_out(
+def squeeze_hold_or_exit(
+    df:            pd.DataFrame,
     entry_price:   float,
     current_price: float,
-    sold_levels:   list,  # 이미 청산된 레벨 인덱스 목록
-) -> tuple[bool, str, int, float]:
+    peak_price:    float,
+    dynamic_stop:  float,   # 현재까지 누적된 동적 손절가
+    atr:           float = 0.0,
+    atr_mult:      float = 1.5,
+) -> tuple[bool, str, float]:
     """
-    분할 청산 레벨 도달 확인.
+    스퀴즈 포지션 보유/청산 판단.
+
+    1. 동적 손절가 업데이트 (매 틱마다 고점 갱신 → 스탑 상향)
+    2. 현재가 vs 동적 손절가 비교
+    3. 오더플로우 분배 감지 시 청산 신호
 
     Returns:
-        (should_partial: bool, reason: str, level_idx: int, sell_ratio: float)
-        sell_ratio: 현재 잔량 대비 청산 비율 (0.25 = 25%)
+        (should_exit: bool, reason: str, new_dynamic_stop: float)
     """
-    if entry_price <= 0:
-        return False, "", -1, 0.0
+    # ── 동적 손절가 업데이트 ─────────────────────────────────────────
+    new_stop = compute_trailing_stop(entry_price, peak_price, dynamic_stop)
+
+    # ── 초기 ATR 손절 (포지션 보호 최소선) ───────────────────────────
+    if atr > 0 and dynamic_stop == 0:
+        atr_stop = entry_price - atr * atr_mult
+        new_stop = max(new_stop, atr_stop)
+
+    # ── 트레일링 스탑 터치 확인 ──────────────────────────────────────
+    hit, reason = is_trailing_stop_hit(current_price, new_stop)
+    if hit:
+        pnl_pct = (current_price - entry_price) / entry_price * 100
+        return True, f"{reason} (수익: {pnl_pct:+.1f}%)", new_stop
+
+    # ── 오더플로우 분배 감지 ─────────────────────────────────────────
+    # 수익이 10% 이상인 상태에서 분배 감지 시 선제 청산
     pnl_pct = (current_price - entry_price) / entry_price
+    if pnl_pct >= 0.10:
+        distributing, dist_reason = is_distribution_detected(df)
+        if distributing:
+            return True, f"오더플로우 분배 감지 — 선제 청산: {dist_reason}", new_stop
 
-    for idx, level in enumerate(SCALE_OUT_LEVELS):
-        if idx in sold_levels:
-            continue  # 이미 청산된 레벨 스킵
-        if pnl_pct >= level["pnl_pct"]:
-            return (
-                True,
-                f"{level['label']} ({pnl_pct*100:.1f}% >= +{level['pnl_pct']*100:.0f}%)",
-                idx,
-                level["sell_ratio"],
-            )
-    return False, "", -1, 0.0
+    # ── RSI 다이버전스 (고점은 더 높지만 RSI는 더 낮음 = 약세 다이버전스) ──
+    if "rsi_14" not in df.columns:
+        df = compute_indicators(df)
+    rsi_series = df["rsi_14"].dropna()
+    if len(rsi_series) >= 10 and pnl_pct >= 0.30:
+        recent_rsi = rsi_series.tail(5).values
+        # RSI가 70 이상이었다가 60 아래로 꺾임 = 모멘텀 소진
+        if recent_rsi[-5] > 70 and recent_rsi[-1] < 60:
+            return True, f"RSI 모멘텀 소진 ({recent_rsi[-5]:.0f} → {recent_rsi[-1]:.0f})", new_stop
+
+    return False, "", new_stop
 
 
-def squeeze_breakeven_stop(
+# ─────────────────────────────────────────────────────────────────────
+# 손익분기점 이동 (손실 없는 구간 확보)
+# ─────────────────────────────────────────────────────────────────────
+def get_breakeven_stop(
     entry_price:   float,
     current_price: float,
-    breakeven_trigger_pct: float = 0.10,  # +10% 도달 시 손익분기점으로 손절 이동
+    trigger_pct:   float = 0.10,  # +10% 도달 시 손익분기점으로 이동
 ) -> float:
     """
-    수익 +10% 도달 시 손절가를 손익분기점(진입가)으로 올림.
-    Returns: 적용할 손절가 (0.0이면 변경 없음)
+    수익 +trigger_pct 달성 시 손절가를 손익분기점(진입가)으로 올림.
+    Returns: 적용할 손절가 (0이면 미적용)
     """
     if entry_price <= 0:
         return 0.0
-    pnl_pct = (current_price - entry_price) / entry_price
-    if pnl_pct >= breakeven_trigger_pct:
-        return entry_price  # 손절을 진입가로 이동 (손실 없음 보장)
+    if (current_price - entry_price) / entry_price >= trigger_pct:
+        return entry_price  # 손절 = 진입가 → 이 포지션에서 절대 손실 없음
     return 0.0
 
 
-# 하위 호환성을 위한 래퍼 (기존 _exit_squeeze 코드에서 호출 가능)
-def squeeze_partial_exit(
-    entry_price:   float,
-    current_price: float,
-    first_tp_pct:  float = 0.20,  # 1차 분할 청산 기준 (기존 5% → 20%로 수정)
-) -> tuple[bool, str]:
-    """
-    1차 분할 청산 레벨 도달 확인 (단순 버전).
-    급등주 대응: 5% 고정 익절 대신 20% 도달 시 25% 분할 청산.
-
-    Returns:
-        (should_partial_exit: bool, reason: str)
-    """
-    if entry_price <= 0:
-        return False, ""
-    pnl_pct = (current_price - entry_price) / entry_price
-    if pnl_pct >= first_tp_pct:
-        return True, f"분할 청산 ({pnl_pct*100:.1f}% >= +{first_tp_pct*100:.0f}%, 잔량 25% 매도)"
-    return False, ""
-
-
 # ─────────────────────────────────────────────────────────────────────
-# 5단계: 스캘핑 재진입 판단 (익절 후 눌림목)
+# 스캘핑 재진입 판단 (급등 후 눌림목 → 2차 탑승)
 # ─────────────────────────────────────────────────────────────────────
 def scalp_reentry(
-    df:            pd.DataFrame,
-    partial_exit_price: float,     # 1차 익절가
-    current_price: float,
-    pullback_pct:  float = 0.02,   # 눌림목 기준 (익절가 대비 -2%)
-    min_volume_ratio: float = 1.2, # 재진입 거래량 기준 (낮춤)
+    df:                pd.DataFrame,
+    partial_exit_price: float,
+    current_price:     float,
+    pullback_pct:      float = 0.02,
+    min_volume_ratio:  float = 1.2,
 ) -> tuple[bool, str]:
     """
-    1차 익절 후 가격 눌림목에서 스캘핑 재진입 판단.
+    1차 포지션 청산 후 가격 눌림목에서 스캘핑 재진입 판단.
 
     재진입 조건:
-      1. 현재가 < 익절가 × (1 - pullback_pct) (충분히 눌림)
-      2. 거래량 > vol_ma × 1.2 (거래량 유지)
-      3. RSI > 45 (모멘텀이 완전히 꺾이지 않음)
-      4. squeeze_mom > 0 (상승 모멘텀 유지)
+      1. 현재가 < 청산가 × (1 - pullback_pct) — 눌림목 확인
+      2. 거래량 > 평균 × 1.2 — 매수 재개 확인
+      3. RSI > 45 — 모멘텀 완전 소진 아님
+      4. 오더플로우 매수 우위 복귀 — 세력 재진입 확인
 
     Returns:
         (should_reenter: bool, reason: str)
@@ -217,126 +408,85 @@ def scalp_reentry(
     if partial_exit_price <= 0:
         return False, ""
 
-    # 눌림목 기준 확인
     pullback_threshold = partial_exit_price * (1 - pullback_pct)
     if current_price > pullback_threshold:
         return False, f"눌림목 불충분 ({current_price:.2f} > {pullback_threshold:.2f})"
 
-    if "squeeze_mom" not in df.columns:
+    if "vol_ma20" not in df.columns:
         df = compute_indicators(df)
 
-    last = df.iloc[-1]
-
-    # ── 거래량 확인 ───────────────────────────────────────────────────
+    last   = df.iloc[-1]
     vol    = float(last.get("volume", 0) or 0)
     vol_ma = float(last.get("vol_ma20", 1) or 1)
     if vol_ma > 0 and vol < vol_ma * min_volume_ratio:
         return False, f"재진입 거래량 부족 ({vol/vol_ma:.1f}x)"
 
-    # ── RSI + 모멘텀 확인 ────────────────────────────────────────────
     rsi = latest_rsi(df)
     if rsi < 45:
         return False, f"RSI 하락 ({rsi:.1f} < 45) — 모멘텀 소진"
 
+    # 오더플로우 매수 우위 재확인
+    flow = analyze_order_flow(df, lookback_bars=3)
+    if flow["signal"] == "bearish":
+        return False, f"매도 세력 여전히 우위 (ratio={flow['ratio']:.2f})"
+
     mom = float(last.get("squeeze_mom", 0) or 0)
     if mom <= 0:
-        return False, "스퀴즈 모멘텀 음전환 — 재진입 위험"
+        return False, "스퀴즈 모멘텀 음전환"
 
     reason = (
         f"스캘핑 재진입 — 눌림목:{(current_price/partial_exit_price-1)*100:.1f}%, "
-        f"RSI:{rsi:.1f}, 거래량:{vol/vol_ma:.1f}x"
+        f"RSI:{rsi:.1f}, 거래량:{vol/vol_ma:.1f}x, 매수비:{flow['ratio']:.2f}"
     )
     return True, reason
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 6단계: 모멘텀 소진 청산 (급등 후 잔량 포지션)
-#
-# 급등주 포지션은 거래량 소진 + 모멘텀 역전 신호가 나올 때까지 보유.
-# 트레일링 스탑으로 수익을 최대한 보호하면서 끝까지 끌고 간다.
+# 하위 호환성 래퍼 (main.py에서 호출하는 기존 함수 유지)
 # ─────────────────────────────────────────────────────────────────────
+def squeeze_partial_exit(
+    entry_price:   float,
+    current_price: float,
+    first_tp_pct:  float = 0.20,  # 사용 안 함 — 계단식 트레일링으로 대체
+) -> tuple[bool, str]:
+    """
+    레거시 래퍼. 실제 로직은 squeeze_hold_or_exit()에서 처리.
+    main.py의 _exit_squeeze()에서 호출 시 항상 False 반환 → squeeze_hold_or_exit로 유도.
+    """
+    # 계단식 트레일링 사용 — 고정 익절 없음
+    return False, ""
+
+
 def scalp_exit(
     df:            pd.DataFrame,
     entry_price:   float,
     current_price: float,
     peak_price:    float,
-    tp_pct:        float = 0.15,    # 눌림목 스캘핑 목표 +15% (기존 3% → 15%)
-    sl_pct:        float = 0.03,    # 손절 -3% (기존 1.5% → 3%, 변동성 고려)
-    trail_pct:     float = 0.08,    # 트레일링 8% (기존 1.5% → 8%, 큰 움직임 허용)
+    tp_pct:        float = 0.15,
+    sl_pct:        float = 0.03,
+    trail_pct:     float = 0.08,
 ) -> tuple[bool, str]:
-    """
-    급등 후 잔량 포지션 / 스캘핑 재진입 포지션 청산 판단.
-
-    청산 조건 (우선순위 순):
-      1. 손절 (-3%)
-      2. 트레일링 스탑 (고점 대비 -8%) — 넓은 여유로 큰 상승 허용
-      3. 거래량 소진 (vol < vol_ma × 0.5) + 수익 중 — 모멘텀 소진 신호
-      4. RSI 하락 전환 (70 → 50 이하) — 모멘텀 소진
-      5. 목표가 +15% (스캘핑 재진입 전용 — 잔량 포지션은 적용 안 함)
-
-    Returns:
-        (should_exit: bool, reason: str)
-    """
-    if entry_price <= 0:
-        return False, ""
-
-    pnl_pct = (current_price - entry_price) / entry_price
-
-    # ── 손절 ─────────────────────────────────────────────────────────
-    if pnl_pct <= -sl_pct:
-        return True, f"손절 ({pnl_pct*100:.1f}% <= -{sl_pct*100:.0f}%)"
-
-    # ── 트레일링 스탑 (넓게 — 큰 급등 허용) ─────────────────────────
-    if peak_price > entry_price * 1.10:  # 최소 10% 수익 구간에서만 트레일링 가동
-        drawdown = (current_price - peak_price) / peak_price
-        if drawdown <= -trail_pct:
-            return True, f"트레일링 스탑 (고점 {peak_price:.2f} 대비 {drawdown*100:.1f}%)"
-
-    if "vol_ma20" not in df.columns:
-        df = compute_indicators(df)
-    last   = df.iloc[-1]
-    vol    = float(last.get("volume", 0) or 0)
-    vol_ma = float(last.get("vol_ma20", 1) or 1)
-
-    # ── 거래량 소진 + 수익 중 ──────────────────────────────────────
-    if vol_ma > 0 and vol < vol_ma * 0.5 and pnl_pct > 0.10:
-        return True, f"거래량 소진 ({vol/vol_ma:.1f}x < 0.5x) — 모멘텀 끝, 수익 실현"
-
-    # ── RSI 모멘텀 역전 ───────────────────────────────────────────────
-    rsi_series = df.get("rsi_14", pd.Series(dtype=float))
-    if len(rsi_series.dropna()) >= 3:
-        rsi_vals = rsi_series.dropna().tail(3).values
-        # RSI가 70 이상이었다가 50 이하로 떨어지면 모멘텀 소진
-        if rsi_vals[-3] > 70 and rsi_vals[-1] < 50 and pnl_pct > 0.05:
-            return True, f"RSI 모멘텀 역전 ({rsi_vals[-3]:.0f} → {rsi_vals[-1]:.0f}) — 청산"
-
-    # ── 스캘핑 재진입 목표가 ─────────────────────────────────────────
-    if pnl_pct >= tp_pct:
-        return True, f"스캘핑 목표가 ({pnl_pct*100:.1f}% >= +{tp_pct*100:.0f}%)"
-
-    return False, ""
+    """스캘핑 재진입 포지션 청산 — squeeze_hold_or_exit로 위임."""
+    dynamic_stop = compute_trailing_stop(entry_price, peak_price)
+    should_exit, reason, _ = squeeze_hold_or_exit(
+        df, entry_price, current_price, peak_price, dynamic_stop
+    )
+    return should_exit, reason
 
 
-# ─────────────────────────────────────────────────────────────────────
-# 공통 손절 (스퀴즈 초기 포지션 전체)
-# ─────────────────────────────────────────────────────────────────────
 def squeeze_stop_loss(
     entry_price:   float,
     current_price: float,
     atr:           float,
     atr_mult:      float = 1.5,
 ) -> tuple[bool, str]:
-    """
-    ATR 기반 손절 (스퀴즈 진입 직후 전체 포지션 보호).
-
-    손절가 = 진입가 - (ATR × atr_mult)
-    """
+    """초기 ATR 손절 (계단식 트레일링이 가동되기 전 안전망)."""
     if entry_price <= 0 or atr <= 0:
         return False, ""
     stop_price = entry_price - atr * atr_mult
     if current_price <= stop_price:
         loss_pct = (current_price - entry_price) / entry_price * 100
-        return True, f"ATR 손절 (현재 {current_price:.2f} <= 손절가 {stop_price:.2f}, {loss_pct:.1f}%)"
+        return True, f"ATR 손절 ({current_price:.2f} <= {stop_price:.2f}, {loss_pct:.1f}%)"
     return False, ""
 
 
@@ -344,9 +494,9 @@ def squeeze_stop_loss(
 # 스퀴즈 후보 종목 스캔
 # ─────────────────────────────────────────────────────────────────────
 def scan_squeeze_candidates(
-    symbol_dfs: dict[str, pd.DataFrame],
+    symbol_dfs: dict,
     regime:     str = "bull",
-) -> list[tuple[str, float]]:
+) -> list:
     """
     종목 데이터프레임 딕셔너리에서 스퀴즈 상태인 종목 반환.
 
@@ -356,20 +506,25 @@ def scan_squeeze_candidates(
     candidates = []
     for sym, df in symbol_dfs.items():
         try:
+            if df is None or df.empty:
+                continue
             if "squeeze_mom" not in df.columns:
                 df = compute_indicators(df)
-            if df.empty:
-                continue
-            last     = df.iloc[-1]
-            sq_on    = bool(last.get("squeeze_on", False))
-            sq_off   = bool(last.get("squeeze_off", False))
-            sq_mom   = float(last.get("squeeze_mom", 0) or 0)
-            sq_rise  = bool(last.get("squeeze_rising", False))
+            last    = df.iloc[-1]
+            sq_on   = bool(last.get("squeeze_on",   False))
+            sq_off  = bool(last.get("squeeze_off",  False))
+            sq_mom  = float(last.get("squeeze_mom", 0) or 0)
+            sq_rise = bool(last.get("squeeze_rising", False))
 
-            # 발사 직전(sq_on) 또는 발사 직후(sq_off) 종목 선별
             if (sq_on or sq_off) and sq_mom > 0 and sq_rise:
+                # 오더플로우 사전 확인 (매도 우위면 후보 제외)
+                flow = analyze_order_flow(df, lookback_bars=5)
+                if flow["signal"] == "bearish":
+                    logging.debug("[squeeze] %s 매도 우위 — 후보 제외", sym)
+                    continue
                 candidates.append((sym, sq_mom))
-                logging.info("[squeeze] 후보: %s mom=%.4f fired=%s", sym, sq_mom, sq_off)
+                logging.info("[squeeze] 후보: %s mom=%.4f flow=%.2fx fired=%s",
+                             sym, sq_mom, flow["ratio"], sq_off)
         except Exception as exc:
             logging.debug("[squeeze] %s 스캔 실패: %s", sym, exc)
 

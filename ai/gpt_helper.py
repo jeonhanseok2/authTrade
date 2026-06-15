@@ -1,25 +1,13 @@
 # ai/gpt_helper.py
-import os
+"""
+(구) OpenAI GPT 헬퍼 → Gemini Flash로 교체.
+기존 호출 코드의 인터페이스를 유지하여 하위 호환성 보장.
+"""
 from typing import Optional
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+from ai.gemini_helper import summarize_news as _gemini_summarize
+
 
 def summarize_news(symbol: str, news_text: str) -> Optional[str]:
-    if not OPENAI_API_KEY:
-        return None
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        prompt = f"""You are a trading assistant. Summarize in Korean:
-- Symbol: {symbol}
-- News: {news_text}
-- Extract: catalysts, risks, and likely price impact (bullish/bearish/neutral). Keep it under 5 bullet points."""
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[{"role":"user","content":prompt}],
-            temperature=0.2,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception:
-        return None
+    """뉴스 요약 — Gemini 1.5 Flash 사용."""
+    return _gemini_summarize(symbol, news_text)

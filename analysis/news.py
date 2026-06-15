@@ -163,36 +163,20 @@ def extract_keyword_frequency(articles: List[Dict], top_n: int = 10) -> List[tup
 
 def gpt_summarize_news(symbol: str, articles: List[Dict]) -> Optional[str]:
     """
-    GPT로 종목 뉴스 한국어 요약.
+    Gemini Flash로 종목 뉴스 한국어 요약.
     촉매, 리스크, 가격 영향 예측 포함.
+    (함수명은 기존 호환성 유지를 위해 gpt_summarize_news 그대로 사용)
     """
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key or not articles:
+    if not articles:
         return None
     try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key, timeout=15.0)
+        from ai.gemini_helper import summarize_news as _gemini_summarize
         news_text = "\n".join(
             f"- {a['headline']}. {a['summary'][:200]}" for a in articles[:5]
         )
-        prompt = (
-            f"종목: {symbol}\n"
-            f"뉴스:\n{news_text}\n\n"
-            "위 뉴스를 한국어로 요약하세요:\n"
-            "1. 핵심 촉매 (주가 상승 요인)\n"
-            "2. 주요 리스크\n"
-            "3. 단기 가격 영향 예측 (강한 상승/약한 상승/중립/하락)\n"
-            "각 항목 1줄 이내로 간결하게."
-        )
-        resp = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=200,
-        )
-        return resp.choices[0].message.content.strip()
+        return _gemini_summarize(symbol, news_text)
     except Exception as exc:
-        logging.debug("[news] GPT 요약 실패: %s", exc)
+        logging.debug("[news] Gemini 요약 실패: %s", exc)
     return None
 
 

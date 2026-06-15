@@ -2,14 +2,21 @@
 """
 청산 조건 함수 모음.
 
-우선순위:
+완전청산 우선순위:
   1. hard_stop_gap_down   — 장 시작 갭락 > 손절폭 → 즉시 시장가 청산
-  2. effective_stop_price — min(고정손절가, ATR손절가) 더 타이트한 쪽
-  3. take_profit_hit      — 목표가 도달
-  4. trailing_stop_active — 트레일링 스탑
-  5. rsi_overbought_exit  — RSI 과매수 모멘텀 소진
-  6. eod_exit             — 장 마감 전 인트라데이 강제청산
-  7. bid_ask_spread_exit  — Spread 급확대 (버킷3 전용)
+  2. effective_stop_price — max(고정손절가, ATR손절가) 더 타이트한 쪽
+  3. breakeven_stop_hit   — 고점 +15% 이후 현재가 진입가 이하 → 본전 스탑
+  4. take_profit_hit      — 목표가 도달
+  5. trailing_stop_active — 트레일링 스탑
+  6. rsi_overbought_exit  — RSI 과매수 모멘텀 소진
+  7. eod_exit             — 장 마감 전 인트라데이 강제청산
+  8. bid_ask_spread_exit  — Spread 급확대 (버킷3 전용)
+
+분할청산 (B3 squeeze 전용):
+  +20% → 잔량 25% 매도 (stage 1)
+  +40% → 잔량 33% 매도 (stage 2)
+  +80% → 잔량 50% 매도 (stage 3)
+  이후  → ATR 트레일링으로 잔량 추적
 """
 from __future__ import annotations
 
@@ -137,6 +144,68 @@ def effective_stop_price(
 # ─────────────────────────────────────────────────────────────────────
 # 신규: Bid-Ask Spread 탈출 (버킷 3 전용)
 # ─────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────
+# 신규: Breakeven Stop
+# ─────────────────────────────────────────────────────────────────────
+
+def breakeven_stop_hit(
+    entry_price:  float,
+    last_price:   float,
+    peak_price:   float,
+    trigger_pct:  float = 0.15,
+) -> bool:
+    """
+    본전 스탑: 최고가가 +trigger_pct 이상 도달한 후 현재가가 진입가 이하로 내려오면 청산.
+
+    목적: 한때 크게 올랐다가 원점 복귀하는 상황에서 손실 없이 탈출.
+    예) 진입 $100 → 고점 $117(+17%) → 현재 $99 → True (본전 스탑 발동)
+    """
+    if entry_price <= 0 or peak_price < entry_price * (1.0 + trigger_pct):
+        return False
+    return last_price <= entry_price
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 신규: 분할 청산 스케줄 (B3 squeeze 전용)
+# ─────────────────────────────────────────────────────────────────────
+
+# (수익률 트리거, 잔량 중 매도 비율)
+PARTIAL_EXIT_SCHEDULE: list[tuple[float, float]] = [
+    (0.20, 0.25),   # +20% → 잔량 25% 매도
+    (0.40, 0.33),   # +40% → 잔량 33% 매도
+    (0.80, 0.50),   # +80% → 잔량 50% 매도
+]
+
+
+def partial_exit_check(
+    entry_price:   float,
+    last_price:    float,
+    current_stage: int,
+) -> tuple[int, float]:
+    """
+    분할 청산 스케줄 확인.
+
+    Args:
+        entry_price:   진입가
+        last_price:    현재가
+        current_stage: 현재까지 완료된 분할 청산 단계 (0=없음, 1~3)
+
+    Returns:
+        (new_stage, sell_ratio)
+        sell_ratio > 0  → 잔량 중 해당 비율 즉시 매도
+        sell_ratio == 0 → 아직 분할 청산 시점 아님
+    """
+    if entry_price <= 0:
+        return current_stage, 0.0
+    for i, (trigger_pct, sell_ratio) in enumerate(PARTIAL_EXIT_SCHEDULE):
+        stage = i + 1
+        if current_stage >= stage:
+            continue
+        if last_price >= entry_price * (1.0 + trigger_pct):
+            return stage, sell_ratio
+    return current_stage, 0.0
+
 
 def bid_ask_spread_exit(
     bid: float,

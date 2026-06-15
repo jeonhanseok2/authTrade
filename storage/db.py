@@ -6,14 +6,15 @@ from typing import Dict, List, Optional
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS positions (
-    symbol      TEXT PRIMARY KEY,
-    strategy    TEXT NOT NULL,
-    entry_price REAL NOT NULL,
-    entry_ts    TEXT NOT NULL,
-    peak_price  REAL NOT NULL,
-    qty         INTEGER NOT NULL,
-    sector      TEXT DEFAULT '',
-    status      TEXT DEFAULT 'open'
+    symbol        TEXT PRIMARY KEY,
+    strategy      TEXT NOT NULL,
+    entry_price   REAL NOT NULL,
+    entry_ts      TEXT NOT NULL,
+    peak_price    REAL NOT NULL,
+    qty           INTEGER NOT NULL,
+    sector        TEXT DEFAULT '',
+    status        TEXT DEFAULT 'open',
+    partial_stage INTEGER DEFAULT 0   -- 분할 청산 완료 단계 (0~3)
 );
 
 CREATE TABLE IF NOT EXISTS trades (
@@ -93,6 +94,19 @@ class PositionDB:
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """기존 DB에 신규 컬럼 추가 (idempotent)."""
+        migrations = [
+            "ALTER TABLE positions ADD COLUMN partial_stage INTEGER DEFAULT 0",
+        ]
+        for sql in migrations:
+            try:
+                self._conn.execute(sql)
+                self._conn.commit()
+            except Exception:
+                pass  # 이미 존재하는 컬럼이면 무시
 
     # ── 포지션 관리 ────────────────────────────────────────────────
 
@@ -110,6 +124,14 @@ class PositionDB:
                (symbol, strategy, entry_price, entry_ts, peak_price, qty, sector, status)
                VALUES (?, ?, ?, ?, ?, ?, ?, 'open')""",
             (symbol, strategy, entry_price, ts, entry_price, qty, sector),
+        )
+        self._conn.commit()
+
+    def update_partial_stage(self, symbol: str, stage: int, new_qty: int) -> None:
+        """분할 청산 단계 + 잔여 수량 업데이트."""
+        self._conn.execute(
+            "UPDATE positions SET partial_stage = ?, qty = ? WHERE symbol = ? AND status = 'open'",
+            (stage, new_qty, symbol),
         )
         self._conn.commit()
 

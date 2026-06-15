@@ -28,6 +28,7 @@ from strategy.exits import (
     hard_stop_gap_down, effective_stop_price,
     take_profit_hit, trailing_stop_active,
     rsi_overbought_exit, eod_exit, bid_ask_spread_exit,
+    breakeven_stop_hit, partial_exit_check,
 )
 from storage.db import PositionDB
 
@@ -151,6 +152,28 @@ class Orchestrator:
         from strategy.sizing import budget_cap_size
         return budget_cap_size(budget, price)
 
+    def _do_partial_exit(
+        self, sym: str, qty: int, price: float,
+        new_stage: int, sell_ratio: float, strategy: str,
+    ) -> None:
+        """분할 청산 — 잔량 중 sell_ratio 비율만큼 매도."""
+        sell_qty = max(1, int(qty * sell_ratio))
+        remain   = qty - sell_qty
+        try:
+            self.broker.submit_order(symbol=sym, qty=sell_qty, side="sell", type="market")
+            self.db.update_partial_stage(sym, new_stage, remain)
+            self.db.record_trade(sym, "sell", sell_qty, price, strategy,
+                                 f"partial_exit_stage{new_stage}")
+            pnl = (price - float(self.db.get_open_position(sym)["entry_price"])) * sell_qty
+            self._notify(
+                f"[{strategy.upper()}] {sym} 분할청산 stage{new_stage} "
+                f"{sell_qty}주 @ ${price:.2f}  PnL: {'+'if pnl>=0 else ''}${pnl:.2f}  잔량: {remain}주"
+            )
+            logging.info("[EXIT] %s 분할청산 stage%d %d주 @ $%.2f (잔량 %d주)",
+                         sym, new_stage, sell_qty, price, remain)
+        except Exception as exc:
+            logging.error("[EXIT] %s 분할청산 실패: %s", sym, exc)
+
     def _do_exit(self, sym: str, qty: int, price: float, reason: str, strategy: str) -> None:
         try:
             # 청산 전 포지션 정보 조회 (closed_trades 기록용)
@@ -203,11 +226,12 @@ class Orchestrator:
 
         now = datetime.now(timezone.utc)
         for pos in positions:
-            sym      = pos["symbol"]
-            entry    = float(pos["entry_price"])
-            peak     = float(pos.get("peak_price") or entry)
-            strategy = pos.get("strategy", "")
-            qty      = int(pos.get("qty", 0))
+            sym           = pos["symbol"]
+            entry         = float(pos["entry_price"])
+            peak          = float(pos.get("peak_price") or entry)
+            strategy      = pos.get("strategy", "")
+            qty           = int(pos.get("qty", 0))
+            partial_stage = int(pos.get("partial_stage") or 0)
             if qty <= 0:
                 continue
 
@@ -219,6 +243,17 @@ class Orchestrator:
             if last > peak:
                 await asyncio.to_thread(self.db.update_peak, sym, last)
                 peak = last
+
+            # ── 분할 청산 (B3 squeeze 전용) ──────────────────────────
+            if strategy == "squeeze":
+                new_stage, sell_ratio = partial_exit_check(entry, last, partial_stage)
+                if sell_ratio > 0:
+                    await asyncio.to_thread(
+                        self._do_partial_exit, sym, qty, last, new_stage, sell_ratio, strategy
+                    )
+                    # 잔여 수량으로 갱신 후 계속 전체 청산 여부 체크
+                    qty = max(1, qty - int(qty * sell_ratio))
+                    partial_stage = new_stage
 
             cfg_b = self.cfg.get(strategy, self.cfg.get("risk", {}))
             reason = await asyncio.to_thread(
@@ -240,18 +275,23 @@ class Orchestrator:
         if open_px and hard_stop_gap_down(entry, open_px, stop_pct):
             return "hard_stop_gap_down"
 
-        # 2. 고정손절 vs ATR손절 — 더 타이트한 쪽 우선 (min = 높은 가격)
+        # 2. 고정손절 vs ATR손절 — 더 타이트한 쪽 우선
         atr     = self._fetch_atr(sym)
         atr_mul = float(cfg.get("atr_multiplier", 2.0))
         eff_stop = effective_stop_price(entry, stop_pct, peak, atr, atr_mul)
         if last <= eff_stop:
             return "stop_loss"
 
-        # 3. 목표가 도달
+        # 3. Breakeven Stop — 고점 +15% 도달 후 현재가 진입가 이하
+        breakeven_trigger = float(cfg.get("breakeven_trigger_pct", 0.15))
+        if breakeven_stop_hit(entry, last, peak, breakeven_trigger):
+            return "breakeven_stop"
+
+        # 4. 목표가 도달
         if take_profit_hit(entry, last, cfg):
             return "take_profit"
 
-        # 4. 트레일링 스탑
+        # 5. 트레일링 스탑
         if trailing_stop_active(entry, last, peak, cfg):
             return "trailing_stop"
 
@@ -565,6 +605,13 @@ class Orchestrator:
             gap_and_go_squeeze_entry, symbol, df, candidate, regime
         )
         if not ok:
+            return
+
+        # VWAP 필터 — 현재가 < VWAP이면 갭앤크랩 위험 → 진입 차단
+        from strategy.scanner import vwap_entry_signal
+        vwap_ok, vwap_reason = await asyncio.to_thread(vwap_entry_signal, df)
+        if not vwap_ok:
+            logging.info("[B3] %s VWAP 필터 차단: %s", symbol, vwap_reason)
             return
 
         budget = self.bucket_capital.allocated("squeeze")

@@ -2,10 +2,10 @@
 """
 버킷별 자금 격리 + 성과 기반 동적 비중 조정.
 
-초기 공격적 비중 (소액 계좌 성장 최우선):
-  B1 가치주:  10%   (min 5%,  max 30%)  ← 안전망 수준만 유지
-  B2 ETF:     25%   (min 15%, max 40%)  ← 중간 빈도 수익
-  B3 급등주:  65%   (min 40%, max 80%)  ← 핵심 성장 엔진
+버킷 비중 (B1:B2:B3 = 1:4:5):
+  B1 가치주:  10%   (min 5%,  max 20%)  ← 안전망
+  B2 ETF:     40%   (min 25%, max 55%)  ← 갭없는 날 수익 커버
+  B3 급등주:  50%   (min 30%, max 65%)  ← 핵심 공격
 
 동적 비중 조정 원칙:
   - 수익률 높은 버킷 → 비중 상향 (min/max 범위 내)
@@ -26,9 +26,9 @@ from typing import Dict
 
 BUCKETS = ("value_long", "etf_swing", "squeeze")
 
-BASE_WEIGHTS: Dict[str, float] = {"value_long": 0.10, "etf_swing": 0.25, "squeeze": 0.65}
-MIN_WEIGHTS:  Dict[str, float] = {"value_long": 0.05, "etf_swing": 0.15, "squeeze": 0.40}
-MAX_WEIGHTS:  Dict[str, float] = {"value_long": 0.30, "etf_swing": 0.40, "squeeze": 0.80}
+BASE_WEIGHTS: Dict[str, float] = {"value_long": 0.10, "etf_swing": 0.40, "squeeze": 0.50}
+MIN_WEIGHTS:  Dict[str, float] = {"value_long": 0.05, "etf_swing": 0.25, "squeeze": 0.30}
+MAX_WEIGHTS:  Dict[str, float] = {"value_long": 0.20, "etf_swing": 0.55, "squeeze": 0.65}
 
 
 @dataclass

@@ -53,8 +53,8 @@ value_long:
 # 초기 공격적 운용: 25%
 etf_swing:
   watchlist_file: watchlists/etf_symbols.txt
-  bucket_pct: 0.25                 # 총 자산의 25%
-  max_positions: 2                 # 소액이라 최대 2종목으로 제한
+  bucket_pct: 0.40                 # 총 자산의 40% (갭없는 날 수익 커버)
+  max_positions: 3
   timeframe: auto                  # auto / short / swing / long
   short_tp_pct: 0.03               # 단기 목표 +3%
   short_sl_pct: 0.02               # 단기 손절 -2%
@@ -75,8 +75,8 @@ etf_swing:
 #   이후       → ATR 트레일링으로 잔량 추적
 squeeze:
   watchlist_file: watchlists/symbols.txt
-  bucket_pct: 0.65                 # 총 자산의 65%
-  max_positions: 2                 # Cash T+1: 1~2종목 집중
+  bucket_pct: 0.50                 # 총 자산의 50%
+  max_positions: 3                 # $7,400 → 풀 2~3개 분할 운용
   # ── 프리마켓 갭업 스캐너 기준 ────────────────────────────────────
   # 실증 데이터: 진짜 급등주 갭업 평균 47%, RVOL 평균 26.7x
   min_gap_pct: 20.0                # 최소 갭업 20% (4% 이상이면 Gap&Go 후보)

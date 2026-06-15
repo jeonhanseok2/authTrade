@@ -1,0 +1,43 @@
+# 가치주 장기투자 워치리스트
+# 기준: PER<20, ROE>12%, 배당수익률>1.5%, 부채비율<80%
+# 섹터 분산 목적으로 선정
+
+# 금융
+JPM
+BRK-B
+BAC
+WFC
+
+# 헬스케어
+JNJ
+MRK
+ABT
+PFE
+
+# 필수소비재
+KO
+PG
+WMT
+CL
+
+# 산업
+MMM
+CAT
+HON
+DE
+
+# 유틸리티
+NEE
+DUK
+SO
+
+# 에너지
+XOM
+CVX
+COP
+
+# 기술 (가치)
+AAPL
+MSFT
+CSCO
+IBM

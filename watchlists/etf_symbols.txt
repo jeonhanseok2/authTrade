@@ -1,0 +1,33 @@
+# ETF 스윙/장기/단기 워치리스트
+# 광의 시장, 섹터, 안전자산, 인버스 ETF
+
+# 광의 시장 (롱)
+SPY
+QQQ
+IWM
+DIA
+
+# 섹터 ETF (SPDR)
+XLK
+XLF
+XLE
+XLV
+XLI
+XLY
+XLC
+XLP
+XLRE
+XLU
+XLB
+
+# 테마/기타
+GLD
+TLT
+UUP
+EEM
+VWO
+
+# 인버스 (bear 레짐 헤지용)
+SQQQ
+SDS
+SPXS

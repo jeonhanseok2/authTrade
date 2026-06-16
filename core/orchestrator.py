@@ -264,13 +264,15 @@ class Orchestrator:
                 peak = last
 
             # ── 분할 청산 (B3 squeeze 전용) ──────────────────────────
-            if strategy == "squeeze":
+            # partial_exits_enabled: false → 기계적 % 분할 비활성화
+            # 대신 _check_exit_reason 내 분배(distribution) 감지 시 50% 부분 청산
+            squeeze_cfg = self.cfg.get("squeeze", {})
+            if strategy == "squeeze" and squeeze_cfg.get("partial_exits_enabled", True):
                 new_stage, sell_ratio = partial_exit_check(entry, last, partial_stage)
                 if sell_ratio > 0:
                     await asyncio.to_thread(
                         self._do_partial_exit, sym, qty, last, new_stage, sell_ratio, strategy
                     )
-                    # 잔여 수량으로 갱신 후 계속 전체 청산 여부 체크
                     qty = max(1, qty - int(qty * sell_ratio))
                     partial_stage = new_stage
 
@@ -279,9 +281,22 @@ class Orchestrator:
                 self._check_exit_reason, sym, entry, last, peak, cfg_b, strategy, now
             )
             if reason:
-                await asyncio.to_thread(self._do_exit, sym, qty, last, reason, strategy)
-                if self._stream and strategy == "squeeze":
-                    self._stream.release(sym)
+                # 분배 감지 → 부분 청산 후 포지션 유지 (전량 청산 아님)
+                if reason.startswith("distribution_partial:"):
+                    dist_ratio = float(reason.split(":")[1])
+                    sell_qty = max(1, int(qty * dist_ratio))
+                    await asyncio.to_thread(
+                        self._do_partial_exit, sym, qty, last,
+                        partial_stage + 10,  # 분배 청산은 stage 10+으로 구분
+                        dist_ratio, strategy
+                    )
+                    qty -= sell_qty
+                    if qty <= 0 and self._stream and strategy == "squeeze":
+                        self._stream.release(sym)
+                else:
+                    await asyncio.to_thread(self._do_exit, sym, qty, last, reason, strategy)
+                    if self._stream and strategy == "squeeze":
+                        self._stream.release(sym)
 
     def _check_exit_reason(
         self, sym, entry, last, peak, cfg, strategy, now
@@ -306,15 +321,37 @@ class Orchestrator:
         if breakeven_stop_hit(entry, last, peak, breakeven_trigger):
             return "breakeven_stop"
 
-        # 4. 목표가 도달
-        if take_profit_hit(entry, last, cfg):
+        # 4. 목표가 도달 — squeeze는 분할청산+ATR트레일링으로 수익 극대화, 고정 TP 없음
+        if strategy != "squeeze" and take_profit_hit(entry, last, cfg):
             return "take_profit"
 
-        # 5. 트레일링 스탑
-        if trailing_stop_active(entry, last, peak, cfg):
+        # 5. 분배(distribution) 감지 — squeeze 전용 부분 청산 트리거
+        # 기계적 % 분할 대신: 매도세가 매수세를 실제로 압도할 때 50% 청산
+        if strategy == "squeeze":
+            pnl_pct = (last - entry) / entry if entry > 0 else 0.0
+            dist_ratio = float(cfg.get("distribution_exit_ratio", 0.50))
+            if pnl_pct >= 0.15:  # 최소 +15% 이상 수익 구간에서만 분배 감지
+                df_recent = self._fetch_bars(sym, "5Min", 20)
+                if df_recent is not None and not df_recent.empty:
+                    from strategy.squeeze import is_distribution_detected
+                    distributing, dist_reason = is_distribution_detected(df_recent, lookback_bars=5)
+                    if distributing:
+                        logging.info("[EXIT][%s] 분배 감지 → %d%% 부분 청산: %s",
+                                     sym, int(dist_ratio * 100), dist_reason)
+                        return f"distribution_partial:{dist_ratio}"
+
+        # 6. 트레일링 스탑
+        if strategy == "squeeze":
+            # TIERED_ATR_MULT 계단식 트레일링 (300%+ 급등도 고점 근처에서 청산)
+            from strategy.squeeze import compute_trailing_stop, is_trailing_stop_hit
+            dyn_stop = compute_trailing_stop(entry, peak, current_stop=0.0, atr=atr)
+            triggered, _ = is_trailing_stop_hit(last, dyn_stop)
+            if triggered:
+                return "trailing_stop"
+        elif trailing_stop_active(entry, last, peak, cfg):
             return "trailing_stop"
 
-        # 5. 장 마감 N분 전 — 인트라데이 전략만 (squeeze/etf_swing)
+        # 7. 장 마감 N분 전 — 인트라데이 전략만 (squeeze/etf_swing)
         if strategy in ("squeeze", "etf_swing"):
             mins = int(self.cfg.get("risk", {}).get("eod_exit_minutes_before_close", 15))
             if eod_exit(now, mins):

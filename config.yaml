@@ -87,8 +87,12 @@ squeeze:
   min_days_to_cover: 3.0           # 최소 Days to Cover
   # ── TTM 스퀴즈 (일봉/주봉) 거래량 기준 ──────────────────────────
   min_volume_ratio: 3.0            # TTM 스퀴즈 거래량 기준 3배
+  # ── 청산 전략: 매수세가 죽을 때까지 보유 ─────────────────────────
+  # 기계적 분할(25%@+20%, 33%@+40%, 50%@+80%) → 5배 급등 시 수익 +130% (나쁨)
+  # 분배 감지 후 ATR 트레일링 → 5배 급등 시 수익 +350%+ (좋음)
+  partial_exits_enabled: false     # 기계적 % 분할 비활성화 (true 시 복구)
+  distribution_exit_ratio: 0.50   # 분배(distribution) 감지 시 잔량 50% 청산
   # ATR 기반 트레일링 (SOUN +33% 단일봉, MSTR +46% 단일봉 → 고정 8% 스탑은 매일 털림)
-  # 스탑 거리 = max(ATR × atr_mult, peak × floor_pct) — 자동으로 변동성에 맞게 조정
   atr_multiplier: 3.0              # 초기 진입 손절: ATR×3 (충분한 변동성 허용)
   breakeven_trigger_pct: 0.15      # +15% 도달 시 손절선 손익분기점으로 이동
   scalp_tp_pct: 0.20               # 눌림목 스캘핑 목표 +20%

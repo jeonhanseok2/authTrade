@@ -30,6 +30,7 @@ from strategy.exits import (
     rsi_overbought_exit, eod_exit, bid_ask_spread_exit,
     breakeven_stop_hit, partial_exit_check,
 )
+from strategy.exit_strategy import ExitStrategyEngine, ExitDecision
 from storage.db import PositionDB
 
 # 인버스 ETF 헤지 종목
@@ -65,6 +66,9 @@ class Orchestrator:
         self._prev_regime: str    = "bull"
         self._stream: Optional[Bucket3Stream] = None
         self._hedge_active: bool  = False  # Panic 헤지 포지션 보유 중 여부
+
+        # B3 급등주 전용 고도화 청산 엔진 (개미 털기 방어 + 가변 ATR)
+        self.exit_engine = ExitStrategyEngine(notify=self._notify)
 
     # ──────────────────────────────────────────────────────────────────
     # 공통 유틸
@@ -316,6 +320,39 @@ class Orchestrator:
                     qty = max(1, qty - int(qty * sell_ratio))
                     partial_stage = new_stage
 
+            # ── ExitStrategyEngine: B3 고도화 청산 (가변 ATR + 개미 털기 방어) ─
+            # hard_stop / stop_loss / distribution 은 _check_exit_reason 에서 처리.
+            # 이 엔진은 trailing_stop 판단을 대체하며 breakeven_trap / orderflow 도 추가.
+            if strategy == "squeeze":
+                atr_now = await asyncio.to_thread(self._fetch_atr, sym)
+                df_flow = await asyncio.to_thread(self._fetch_bars, sym, "5Min", 100)
+                peak_pnl_pct = (peak - entry) / entry if entry > 0 else 0.0
+
+                # 거래량 정보 추출
+                cur_vol, avg_vol_20 = 0.0, 0.0
+                if df_flow is not None and not df_flow.empty:
+                    cur_vol = float(df_flow.iloc[-1].get("volume", 0) or 0)
+                    from strategy.signals import compute_indicators
+                    if "vol_ma20" not in df_flow.columns:
+                        df_flow = compute_indicators(df_flow)
+                    avg_vol_20 = float(df_flow.iloc[-1].get("vol_ma20", 0) or 0)
+
+                signal = await asyncio.to_thread(
+                    self.exit_engine.assess,
+                    sym, entry, last, peak, atr_now, df_flow,
+                    cur_vol, avg_vol_20, peak_pnl_pct,
+                )
+
+                if signal.decision == ExitDecision.SELL:
+                    await asyncio.to_thread(self._do_exit, sym, qty, last, signal.reason, strategy)
+                    if self._stream:
+                        self._stream.release(sym)
+                    continue   # 청산 완료 → 이하 _check_exit_reason 스킵
+
+                if signal.decision == ExitDecision.SHAKEOUT_WAIT:
+                    continue   # 이번 사이클 스킵 (대기 중)
+                # HOLD → _check_exit_reason 로 폴스루
+
             cfg_b = self.cfg.get(strategy, self.cfg.get("risk", {}))
             reason = await asyncio.to_thread(
                 self._check_exit_reason, sym, entry, last, peak, cfg_b, strategy, now
@@ -381,16 +418,8 @@ class Orchestrator:
                         return f"distribution_partial:{dist_ratio}"
 
         # 6. 트레일링 스탑
-        if strategy == "squeeze":
-            # TIERED_ATR_MULT 계단식 트레일링 (300%+ 급등도 고점 근처에서 청산)
-            from strategy.squeeze import compute_trailing_stop, is_trailing_stop_hit
-            # VIX > 25: ATR 트레일링 배수 1.5x 확장 (변동성 장세에서 스탑 공간 확보)
-            vix_scale = 1.5 if self._prev_vix > 25.0 else 1.0
-            dyn_stop = compute_trailing_stop(entry, peak, current_stop=0.0, atr=atr * vix_scale)
-            triggered, _ = is_trailing_stop_hit(last, dyn_stop)
-            if triggered:
-                return "trailing_stop"
-        elif trailing_stop_active(entry, last, peak, cfg):
+        # squeeze: ExitStrategyEngine(_exit_cycle)에서 이미 처리 — 여기선 스킵
+        if strategy != "squeeze" and trailing_stop_active(entry, last, peak, cfg):
             return "trailing_stop"
 
         # 7. 장 마감 N분 전 — 인트라데이 전략만 (squeeze/etf_swing)

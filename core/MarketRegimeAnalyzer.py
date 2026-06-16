@@ -21,6 +21,7 @@ import zoneinfo
 
 from core.regime_engine          import RegimeEngine, MarketMode
 from strategy.confidence_scanner import ConfidenceScanner, ConfidenceScore
+from strategy.news_analyzer      import NewsAnalyzer
 
 ET                    = zoneinfo.ZoneInfo("America/New_York")
 PREMARKET_SCAN_HOUR   = 9
@@ -65,12 +66,14 @@ class MarketRegimeAnalyzer:
         regime_engine: RegimeEngine,
         conf_scanner:  ConfidenceScanner,
         notify:        Optional[Callable[[str], None]] = None,
+        news_analyzer: Optional[NewsAnalyzer] = None,
     ) -> None:
-        self._regime      = regime_engine
-        self._scanner     = conf_scanner
-        self._notify      = notify or (lambda _: None)
-        self._last_result: Optional[ScanResult] = None
-        self._last_date:   _date = _date.min
+        self._regime        = regime_engine
+        self._scanner       = conf_scanner
+        self._notify        = notify or (lambda _: None)
+        self._news          = news_analyzer   # None이면 뉴스 보정 비활성
+        self._last_result:  Optional[ScanResult] = None
+        self._last_date:    _date = _date.min
 
     # ── 상태 조회 ─────────────────────────────────────────────────────
 
@@ -127,7 +130,18 @@ class MarketRegimeAnalyzer:
                     continue
 
                 sc = await asyncio.to_thread(self._scanner.score, sym, df)
-                if sc.is_tradeable:
+
+                # 뉴스 심리 보정: 최종 신뢰도 = 차트×0.7 + 뉴스×0.3
+                effective_score = sc.total
+                if self._news:
+                    if self._news.is_blocked(sym):
+                        logging.info("[MarketRegimeAnalyzer] %s 뉴스 차단 — 스킵", sym)
+                        continue
+                    effective_score = await asyncio.to_thread(
+                        self._news.blend, sym, sc.total
+                    )
+
+                if effective_score >= 70:   # 보정 후 기준으로 판단
                     scores[sym] = sc
                     qualified += 1
 

@@ -37,6 +37,7 @@ from strategy.b2_allocation      import B2AllocationEngine, B2AllocMode
 from core.MarketRegimeAnalyzer   import MarketRegimeAnalyzer
 from core.StrategyManager        import StrategyManager
 from core.AccountManager         import AccountManager
+from strategy.news_analyzer      import NewsAnalyzer
 from storage.db import PositionDB
 
 # 인버스 ETF 헤지 종목
@@ -80,11 +81,15 @@ class Orchestrator:
         self.b2_alloc      = B2AllocationEngine(notify=self._notify)
 
         # ── 고수준 모듈 (3대 관심사 분리) ────────────────────────────
+        # 뉴스 심리 분석기 (차트 점수 30% 보정)
+        self.news_analyzer = NewsAnalyzer(notify=self._notify)
+
         # 시장 상태 진단: 프리마켓 스캔 → B3/B2 모드 결정
         self.regime_analyzer = MarketRegimeAnalyzer(
             regime_engine=self.regime_engine,
             conf_scanner=self.conf_scanner,
             notify=self._notify,
+            news_analyzer=self.news_analyzer,
         )
         # 계좌 자금 관리: A/B 로테이션 + Settled Cash 재확인
         self.account_mgr = AccountManager(

@@ -1,182 +1,227 @@
-# authTrade — 자동매매 시스템 구조 및 매매 원칙 요약
-> 교차 검증용 문서. 이 내용을 바탕으로 투자 원칙의 허점, 개선점, 위험 요소를 분석해 주세요.
+# authTrade — 사계절 퀀트 엔진 구조 및 매매 원칙 요약
+> 교차 검증용 문서. 최종 업데이트: 2026-06-16
 
 ---
 
 ## 1. 전체 아키텍처
 
 ```
-[main.py - 매 60초 루프]
-  ├─ 사전 체크 (휴장/거래창/서킷브레이커/VIX/데드존)
-  ├─ 시장 레짐 분석 → Bull / Correction / Bear / Panic
-  ├─ [EXIT 우선] 보유 포지션 전부 청산 조건 체크
-  └─ [ENTRY] 버킷 우선순위 순서로 신규 진입
-       ├─ Bucket 3: 급등주 Gap&Go (07:00~09:25 프리마켓 스캔 → 장중 진입)
-       ├─ Bucket 3: TTM Squeeze 진입
-       ├─ Bucket 2: ETF 스윙
-       └─ Bucket 1: 가치주 장기
+[main.py — asyncio.gather 비동기 다중 태스크]
+  ├─ run_exit_loop()         30초 — 전 버킷 포지션 청산 체크
+  ├─ run_monitor_loop()      60초 — 킬스위치 + VIX RoC + 리밸런싱
+  ├─ run_bucket1_loop()      60분 — 가치주 장기
+  ├─ run_bucket2_loop()      15분 — ETF 스윙 or B2 동적 배분
+  ├─ run_bucket3_stream()    이벤트 — WebSocket(Alpaca) / 1초 폴링(Toss)
+  └─ strategy_mgr.run_premarket_loop()  30초 체크 — 매일 9:20 ET 스캔
 
-[분석 레이어]
-  ├─ analysis/market.py   → SPX 200MA + VIX로 레짐 판단
-  ├─ analysis/news.py     → Alpaca 뉴스 수집 + 감성 분석 + Gemini Flash 요약
-  ├─ analysis/governance.py → 기관/내부자/공매도 비율
-  └─ analysis/fundamental.py → PER/PBR/ROE/DCF 점수
+[3대 관심사 분리 모듈]
+  ├─ MarketRegimeAnalyzer  시장 상태 진단 (RegimeEngine + ConfidenceScanner + NewsAnalyzer)
+  ├─ StrategyManager       전략 전환 엔진 (B3/B2 모드 스위칭 + B2 리밸런싱)
+  └─ AccountManager        계좌 자금 관리 (A/B 로테이션 + Settled Cash 재확인)
 
-[AI 레이어]
-  ├─ Gemini Flash: 뉴스 요약, 시장 브리핑, 종목 빠른 분석
-  └─ Gemini Pro: 전략 수정, 포트폴리오 리밸런싱, 큰손실 분석, 레짐 전환
+[사계절 레짐 이중 구조]
+  외부 레짐 (RegimeEngine — 매일 9:20 ET)
+    신뢰도 ≥70점 후보 ≥5개 → B3_AGGRESSIVE (급등주 단타)
+    신뢰도 ≥70점 후보  <5개 → B2_SWING     (지수 ETF 스윙)
+  내부 레짐 (B2AllocationEngine — 15분마다)
+    QQQ+SPY 모두 > MA20  → BULL_LEVERAGE (TQQQ/SOXL/FNGU/LABU Top2 × 50%)
+    하나 이하 > MA20     → DEFENSE_INDEX (QQQ/SPY 모멘텀 강한 1개 × 100%)
+    모두 ≤ MA20          → CASH          (전량 청산)
 
-[인프라]
-  ├─ storage/db.py    → SQLite (포지션/거래/손익 저장)
-  ├─ risk/guard.py    → 서킷브레이커 + 일손실한도 + 주문한도
-  └─ notify/telegram_bot.py → 실시간 알림
+[뉴스 심리 보정 파이프라인]
+  yfinance/Alpaca 뉴스 → 긴급 키워드 차단 → Gemini Flash 심리 점수(-1~+1)
+  최종 신뢰도 = 차트 점수 × 0.7 + 뉴스 점수(0~100환산) × 0.3
+
+[DB 이중 구조]
+  storage/db.py          → PositionDB (포지션/거래/손익 — 기존)
+  storage/db_manager.py  → trades/market_log/system_state (사계절 엔진 전용)
+
+[브로커]
+  BROKER=alpaca (기본): Alpaca Markets API + WebSocket
+  BROKER=toss:          토스증권 Open API + 1초 폴링
 ```
 
 ---
 
-## 2. 버킷별 매매 원칙
-
-### Bucket 1 — 가치주 장기투자 (자산의 75%, 최대 8종목)
+## 2. B3 급등주 모드 (B3_AGGRESSIVE)
 
 **진입 조건 (AND)**
-- 펀더멘털 점수 ≥ 55점 (PER 20pt + PBR 20pt + ROE 20pt + 배당 15pt + 부채 15pt + EPS성장 10pt)
-- DCF 안전마진 ≥ 10% (현주가 < 내재가치)
-- 레짐: Panic이 아닐 것 (Bear에서도 분할매수 허용)
-- 뉴스 감성: bearish 아닐 것
-- RSI < 70 (과매수 구간 진입 자제)
+- 신뢰도 스코어 ≥ 70점 (RVOL 30pt + Alpha vs QQQ 40pt + VWAP 30pt)
+- 뉴스 보정 후 최종 점수: 차트×0.7 + 뉴스×0.3
+- 긴급 키워드(유상증자/소송/실적악화 등) 미감지
+- A/B 그룹 오늘 순번일 것 (홀수 날 A, 짝수 날 B — T+1 프리라이딩 방지)
+- 스푸핑 블랙리스트 미등록
+- 레짐 B3_AGGRESSIVE & 동기화 대기(60s) 완료
 
-**청산 조건 (OR)**
-- 손절: -8%
-- 목표가: +25% (고정 익절)
-- 레짐이 Panic으로 전환 시 전량 청산
-- 펀더멘털 점수가 45점 이하로 하락
-- RSI ≥ 80 (모멘텀 소진)
+**자금 배분**
+| 점수 | 배분 |
+|------|------|
+| ≥ 90점 | 버킷 전액 |
+| 70~89점 | 버킷 절반 |
+| < 70점 | 진입 금지 |
+- 켈리 스케일: 최근 5회 승률 ≥60% → 예산 ×1.2
 
-**핵심 원칙**: 저평가 + 안전마진 확인 후 진입, 큰 손실 방지가 최우선
+**B3 청산 전략 (4-레이어 ExitStrategyEngine)**
+| 우선순위 | 트리거 | 동작 |
+|---------|--------|------|
+| L1 | 본절가 트랩: 고점 +10% 후 진입가 이탈 | 즉시 SELL |
+| L2 | 오더플로우 매도압력 ≥1.5x (100봉) | 즉시 SELL |
+| L3 | ATR 가변 트레일링 스탑 | 수익 <50%: ATR×3, ≥50%: ATR×1.5 |
+| 보조 | 개미털기 방어: 저거래량(avg×0.5) ATR 이탈 | 60초 대기 후 판단 |
 
----
-
-### Bucket 2 — ETF 스윙/단기/장기 (자산의 15%, 최대 4종목)
-
-**ETF 유니버스**: SPY/QQQ/IWM/DIA + 섹터 ETF 11개 + GLD/TLT + SQQQ/SDS(인버스)
-
-**레짐별 ETF 선택**
-- Bull: SPY/QQQ/섹터강세 ETF
-- Correction: SPY/GLD/TLT (방어적)
-- Bear: TLT/GLD + 인버스(SQQQ/SDS)
-- Panic: 진입 차단 (보유 포지션 청산만)
-
-**타임프레임별 손익 기준**
-| 타임프레임 | 목표가 | 손절 |
-|-----------|--------|------|
-| 단기 (auto→ Bull) | +3% | -2% |
-| 스윙 (auto→ Correction) | +8% | -4% |
-| 장기 (auto→ Bear) | +20% | -8% |
-
-**진입 조건**
-- 레짐에 맞는 ETF일 것
-- 섹터 강도 상위 3개 ETF 우선
-- RSI < 70, 거래량 20일 평균 대비 0.5x 이상
+**3분 룰**
+- 진입 3~8분 내 PnL ≤ 0% → 보유 수량 50% 즉시 매도
 
 ---
 
-### Bucket 3 — 급등주 초단타 (자산의 10%, 최대 3종목)
+## 3. B2 지수/ETF 스윙 모드 (B2_SWING)
 
-#### 3-A: Gap&Go (프리마켓 갭업 → 장 시작 직후)
+**B2 유니버스**
+- 레버리지: TQQQ, SOXL, FNGU, LABU
+- 방어: QQQ, SPY
 
-**스캔 기준**
-- 갭업: ≥ 20% (4% 이상이면 후보 등록, 20%+ 강한 신호)
-- RVOL: 프리마켓 5x+, 장중 10x+ (실증: 진짜 급등 평균 26.7x)
-- Float: ≤ 50M주 (20M 이하 이상적)
-- 가격: $1~$50
+**내부 레짐별 전략**
 
-**진입 조건 (AND)**
-- 5분봉 첫 캔들 고점 돌파 (첫 5분 고점 브레이크아웃)
-- VWAP 위에서 거래 (Gap&Crap 방지)
-- 장중 RVOL 10x 이상 유지
+| 내부 레짐 | 조건 | 포트폴리오 |
+|----------|------|-----------|
+| BULL_LEVERAGE | QQQ + SPY 모두 > MA20 | ATR조정수익률 Top2 × 50% |
+| DEFENSE_INDEX | 하나라도 ≤ MA20 | 5일 모멘텀 강한 QQQ 또는 SPY × 100% |
+| CASH | QQQ + SPY 모두 ≤ MA20 | 전량 청산, 현금 대기 |
 
-**청산 전략 (계단식 분할청산)**
-- +20% → 잔량 25% 청산 (1차)
-- +40% → 잔량 33% 청산 (2차)
-- +80% → 잔량 50% 청산 (3차)
-- 이후 → ATR 기반 트레일링 스탑으로 잔량 추적
-
-#### 3-B: TTM Squeeze
-
-**진입 조건**
-- squeeze_on (BB가 KC 안에 있음) → squeeze_off 전환 시 진입
-- Momentum 히스토그램 양수 전환
-- 거래량 20일 평균 대비 3x 이상
-
-**ATR 계단식 트레일링 스탑**
-| 수익구간 | 스탑거리 | 최소바닥 |
-|---------|---------|---------|
-| 0~30% | ATR×3 | 12% |
-| 30~80% | ATR×2.5 | 10% |
-| 80~150% | ATR×2 | 8% |
-| 150~300% | ATR×1.5 | 6% |
-| 300%+ | ATR×1.2 | 5% |
-
-**오더플로우 분석 (Wyckoff)**
-- 캔들별 매수/매도 비율 추적 (close-low)/(high-low)
-- 분배 감지: 매도세 우세 + 거래량 감소 → 즉시 청산
+- ATR 조정 수익률 = 5일 수익률 / ATR14 (리스크 1단위당 수익 기준 순위)
+- 방어 모드 청산: 주봉 MA20(20주) 이탈 시
 
 ---
 
-## 3. 리스크 관리 원칙
+## 4. Cash Account A/B 로테이션 (ACCOUNT_TYPE=cash)
+
+```
+홀수 날 → Group A 활성, Group B 결제 대기
+짝수 날 → Group B 활성, Group A 결제 대기
+
+진입 가능 자금 = min(총자산/2, Settled Cash)
+레짐 전환 시 → AccountManager.on_mode_switch() → broker.get_settled_cash() 재확인
+```
+
+**T+1 안전 장치**
+- Settled Cash = `non_marginable_buying_power` (미결제 자금 제외)
+- 모드 전환 시마다 재조회하여 미결제 현금 진입 원천 차단
+
+---
+
+## 5. 뉴스 심리 분석 (NewsAnalyzer)
+
+**수집 소스** (우선순위)
+1. Alpaca News API (최근 1시간)
+2. yfinance Ticker.news (fallback)
+
+**긴급 차단 키워드**
+`유상증자 / 소송 / 실적 악화 / 상장폐지 / 회계 부정 / 횡령 / secondary offering / class action / SEC investigation / bankruptcy` 등
+
+**Gemini Flash 심리 분석**
+- 입력: 뉴스 제목 최대 10개
+- 출력: -1.0(매우 부정) ~ 1.0(매우 긍정)
+- 실패 시: 내장 Bullish/Bearish 키워드 사전으로 폴백
+
+**신뢰도 통합**
+```
+최종 = int(차트점수 × 0.7 + 뉴스점수(0~100환산) × 0.3)
+```
+
+**DB 기록**: 모든 뉴스 점수는 `market_log` 테이블에 `regime="NEWS:NVDA:+0.73:5:"` 형식으로 저장
+
+---
+
+## 6. DB 구조
+
+### storage/db.py — PositionDB (포지션 저널)
+```sql
+positions  (symbol PK, strategy, entry_price, peak_price, qty, sector, status)
+trades     (id, symbol, side, qty, price, strategy, reason, ts)
+daily_pnl  (date PK, realized, unrealized)
+```
+
+### storage/db_manager.py — 사계절 엔진 전용
+```sql
+trades       (id, symbol, buy_price, sell_price, quantity, mode, result, timestamp)
+market_log   (id, date, nasdaq_ma20, regime, scanner_score, timestamp)
+system_state (key PK, value)
+```
+
+**system_state 주요 키**
+| 키 | 예시 값 |
+|----|---------|
+| CURRENT_MODE | B3_AGGRESSIVE |
+| ACTIVE_GROUP | A |
+| B2_ALLOC_MODE | BULL_LEVERAGE |
+
+---
+
+## 7. 리스크 관리
 
 ### 계좌 레벨
 | 규칙 | 수치 | 동작 |
 |------|------|------|
-| 일 손실 한도 | -2% | 신규 진입 차단, 청산만 허용 |
-| 서킷브레이커 | 지수 -7% | 30분 거래 정지 |
-| VIX 상한 | 30 이상 | 신규 진입 차단 |
-| 최대 포지션 | 설정값 초과 | 신규 진입 차단 |
+| 일 손실 한도 | -2% | 신규 진입 차단 |
+| VIX 절대값 | ≥ 30 | 신규 진입 차단 |
+| VIX 변화율 | 전일 대비 +20% | 선제 진입 차단 + 텔레그램 경고 |
 | 데드존 | 11:30~13:00 ET | 신규 진입 차단 |
 | 장 마감 전 | 15분 전 | 인트라데이 포지션 강제 청산 |
+| Panic 레짐 | VIX > 30 | B3 즉시 청산 + B2 인버스 ETF 헤지(SQQQ/SDS) |
 
 ### 포지션 레벨
-- **ATR 사이징**: 거래당 계좌 1% 리스크, 손절거리 = ATR×2
-- **섹터 집중도**: 동일 섹터 최대 3개 포지션
-- **손절 우선**: 청산 로직이 진입 로직보다 항상 먼저 실행
+- ATR 사이징: 거래당 계좌 1% 리스크, 손절거리 = ATR×2
+- 섹터 집중도: 동일 섹터 최대 3개
+- 청산 로직이 진입 로직보다 항상 먼저 실행
 
 ---
 
-## 4. 시장 레짐 판단 기준
+## 8. 텔레그램 명령어
 
-```
-Bull       : SPX > 200MA AND VIX < 20
-Correction : SPX < 200MA OR VIX 20~30
-Bear       : SPX < 200MA AND VIX 20~30
-Panic      : VIX > 30
-```
-
-- 레짐에 따라 각 버킷의 진입 허용/차단이 달라짐
-- Bear에서도 가치주 분할매수는 허용 (저점 매수 기회)
-- Panic에서는 신규 진입 전면 차단, 기존 포지션 청산 우선
-
----
-
-## 5. 데이터 흐름
-
-```
-Alpaca Markets API → 실시간 가격/거래량
-yfinance           → 펀더멘털 (PER/PBR/ROE/DCF)
-Alpaca News API    → 뉴스 수집
-Gemini Flash/Pro   → AI 분석 및 판단 보조
-SQLite DB          → 포지션/거래 기록 (entry price, peak price)
-Telegram           → 실시간 알림
-```
+| 명령어 | 기능 |
+|--------|------|
+| `/status` | 현재 모드·그룹·오늘 성적·보유 종목 요약 |
+| `/set_mode [B3/B2]` | 레짐 강제 전환 (다음 프리마켓 스캔 전까지 유지) |
+| `/positions` | 포지션 + 진입가 + 고점 |
+| `/account` | 계좌 잔고 |
+| `/journal` | 일일 매매 일지 |
+| `/weekly` | 주간 분석 |
+| `/stats [N]` | 최근 N일 누계 통계 |
+| `/scan` | 급등/저평가 종목 스캔 |
+| `/ask` | Gemini AI에게 질문 |
+| `/buy / /sell` | 수동 주문 |
 
 ---
 
-## 6. 검토 요청 사항
+## 9. 데이터 흐름
 
-다음 관점에서 이 시스템의 **허점, 개선점, 위험 요소**를 분석해 주세요:
+```
+Alpaca Markets API   → 실시간 가격/거래량/뉴스
+yfinance             → 펀더멘털(PER/PBR/ROE/DCF), 일봉/주봉 OHLCV
+Alpaca News API      → 뉴스 수집 (yfinance fallback)
+Gemini Flash         → 뉴스 심리 분석, 종목 빠른 분석, 텔레그램 메시지 생성
+Gemini Pro           → 전략 수정, 포트폴리오 리밸런싱, 큰손실 분석, 레짐전환 심층분석
+SQLite (PositionDB)  → 포지션/거래 저널
+SQLite (db_manager)  → 사계절 엔진 trades/market_log/system_state
+Telegram Bot         → 실시간 알림 + 수동 제어
+```
 
-1. **진입 조건의 충분성**: 각 버킷의 진입 필터가 충분히 정교한가? 빠진 조건이 있는가?
-2. **청산 로직의 완결성**: 모든 시나리오(급등/급락/횡보/레짐전환)에서 청산이 제대로 실행되는가?
-3. **리스크 관리 충분성**: -2% 일손실 한도, ATR 사이징 등이 적절한가?
-4. **버킷 간 충돌**: 세 버킷이 동시에 운용될 때 상충하는 상황이 있는가?
-5. **실전 적용 가능성**: 유동성 부족, 슬리피지, API 지연 등 실전 리스크가 고려되었는가?
-6. **개선 제안**: 추가하면 성과를 높일 수 있는 지표나 필터는 무엇인가?
+---
+
+## 10. 핵심 파일 목록
+
+| 경로 | 역할 |
+|------|------|
+| `core/MarketRegimeAnalyzer.py` | 시장 상태 진단 (프리마켓 스캔 + 뉴스 보정) |
+| `core/StrategyManager.py` | 전략 전환 엔진 (B3/B2 + sync lock) |
+| `core/AccountManager.py` | 계좌 자금 관리 (A/B + Settled Cash) |
+| `core/orchestrator.py` | 비동기 태스크 조율 |
+| `core/regime_engine.py` | B3/B2 모드 감지 + 전환 |
+| `strategy/news_analyzer.py` | 뉴스 수집 + Gemini 심리 분석 + 차단 |
+| `strategy/confidence_scanner.py` | RVOL/Alpha/VWAP 100점 스코어러 |
+| `strategy/exit_strategy.py` | 4-레이어 청산 엔진 (개미털기 방어) |
+| `strategy/b2_allocation.py` | B2 내부 동적 배분 (BULL/DEFENSE/CASH) |
+| `strategy/strategy_engine.py` | 통합 인터페이스 (진입/청산 DB 자동 저장) |
+| `storage/db_manager.py` | trades/market_log/system_state CRUD |
+| `storage/db.py` | PositionDB (포지션 저널) |
+| `main.py` | 진입점 + asyncio.gather |

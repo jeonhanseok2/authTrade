@@ -127,6 +127,14 @@ async def main() -> None:
     if account_type == "cash":
         bucket_capital.enable_ab_rotation(initial_equity=max(equity, 1.0))
         logging.info("[MAIN] Cash Account 모드 — A/B 로테이션 활성 (그룹 %s)", bucket_capital.active_group)
+        # AccountManager: 초기 Settled Cash 동기화
+        if broker_type != "toss":
+            try:
+                settled_init = broker.get_settled_cash()
+                bucket_capital.update_settled_cash(settled_init)
+                logging.info("[MAIN] 초기 Settled Cash: $%.0f", settled_init)
+            except Exception as _e:
+                logging.warning("[MAIN] 초기 Settled Cash 조회 실패: %s", _e)
 
     # ── 오케스트레이터 ────────────────────────────────────────────────
     orch = Orchestrator(
@@ -182,8 +190,8 @@ async def main() -> None:
         orch.run_bucket1_loop(b1_syms),    # 60분 — 가치주 장기
         orch.run_bucket2_loop(),           # 15분 — ETF 스윙 (or B2 동적 배분)
         orch.run_bucket3_stream(b3_syms),  # B3 — PollingStream(Toss) / WebSocket(Alpaca)
-        # 매일 9:20 ET 프리마켓 스캔 → B3/B2 외부 레짐 전환
-        orch.regime_engine.run_premarket_loop(b3_syms, orch.conf_scanner),
+        # 매일 9:20 ET 프리마켓 스캔 → B3/B2 레짐 전환 + 자금 재확인
+        orch.strategy_mgr.run_premarket_loop(b3_syms),
     ]
     # Toss 브로커: 세션 감시 워치독 추가 (세션 끊기면 킬스위치 + 텔레그램)
     if broker_type == "toss" and mode == "live":

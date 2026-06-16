@@ -32,7 +32,7 @@ import yfinance as yf
 
 
 # ── 유니버스 ─────────────────────────────────────────────────────────
-LEVERAGE_ETFS: List[str] = ["TQQQ", "SOXL", "FNGU"]
+LEVERAGE_ETFS: List[str] = ["TQQQ", "SOXL", "FNGU", "LABU"]
 DEFENSE_ETFS:  List[str] = ["QQQ", "SPY"]
 BENCHMARK_ETF: str       = "QQQ"   # 내부 모드 진단 기준
 

@@ -34,6 +34,9 @@ from strategy.exit_strategy      import ExitStrategyEngine, ExitDecision
 from strategy.confidence_scanner import ConfidenceScanner
 from core.regime_engine          import RegimeEngine, MarketMode
 from strategy.b2_allocation      import B2AllocationEngine, B2AllocMode
+from core.MarketRegimeAnalyzer   import MarketRegimeAnalyzer
+from core.StrategyManager        import StrategyManager
+from core.AccountManager         import AccountManager
 from storage.db import PositionDB
 
 # 인버스 ETF 헤지 종목
@@ -70,14 +73,32 @@ class Orchestrator:
         self._stream: Optional[Bucket3Stream] = None
         self._hedge_active: bool  = False  # Panic 헤지 포지션 보유 중 여부
 
-        # B3 고도화 청산 엔진 (개미 털기 방어 + 가변 ATR)
-        self.exit_engine       = ExitStrategyEngine(notify=self._notify)
-        # B3 신뢰도 스코어러 (RVOL/Alpha/VWAP 100점)
-        self.conf_scanner      = ConfidenceScanner()
-        # 외부 레짐 엔진 (B3_AGGRESSIVE vs B2_SWING, 매일 9:20 ET 스캔)
-        self.regime_engine     = RegimeEngine(notify=self._notify)
-        # B2 내부 동적 자산 배분 엔진 (BULL_LEVERAGE/DEFENSE_INDEX/CASH)
-        self.b2_alloc          = B2AllocationEngine(notify=self._notify)
+        # ── 저수준 엔진 (하위 호환 유지) ─────────────────────────────
+        self.exit_engine   = ExitStrategyEngine(notify=self._notify)
+        self.conf_scanner  = ConfidenceScanner()
+        self.regime_engine = RegimeEngine(notify=self._notify)
+        self.b2_alloc      = B2AllocationEngine(notify=self._notify)
+
+        # ── 고수준 모듈 (3대 관심사 분리) ────────────────────────────
+        # 시장 상태 진단: 프리마켓 스캔 → B3/B2 모드 결정
+        self.regime_analyzer = MarketRegimeAnalyzer(
+            regime_engine=self.regime_engine,
+            conf_scanner=self.conf_scanner,
+            notify=self._notify,
+        )
+        # 계좌 자금 관리: A/B 로테이션 + Settled Cash 재확인
+        self.account_mgr = AccountManager(
+            bucket_capital=bucket_capital,
+            notify=self._notify,
+        )
+        # 전략 전환 엔진: B3/B2 모드 스위칭 + B2 리밸런싱 조율
+        self.strategy_mgr = StrategyManager(
+            analyzer=self.regime_analyzer,
+            b2_alloc=self.b2_alloc,
+            account_mgr=self.account_mgr,
+            broker=broker,
+            notify=self._notify,
+        )
         # 종목별 3분 룰 체크 완료 여부 (포지션 청산 시 제거)
         self._3min_checked: set = set()
 
@@ -539,16 +560,8 @@ class Orchestrator:
         if not acct:
             return
 
-        self.bucket_capital.update_equity(acct.equity)
-
-        # A/B 로테이션: 결제 완료 현금 갱신 (Cash Account T+1)
-        if self.bucket_capital._ab_mode and hasattr(self.broker, "get_settled_cash"):
-            try:
-                settled = await asyncio.to_thread(self.broker.get_settled_cash)
-                self.bucket_capital.update_settled_cash(settled)
-                logging.debug("[MONITOR] 결제현금 갱신: $%.0f (그룹 %s)", settled, self.bucket_capital.active_group)
-            except Exception as _e:
-                logging.warning("[MONITOR] 결제현금 조회 실패: %s", _e)
+        # AccountManager 경유 — 총 자산 + Settled Cash 통합 갱신
+        await self.account_mgr.refresh(self.broker)
 
         # 킬스위치 — 미실현 손익 기준
         killed = self.kill_switch.update(acct.equity, acct.day_pnl)
@@ -720,9 +733,9 @@ class Orchestrator:
         while True:
             try:
                 if self._is_tradeable():
-                    # B2_SWING 모드일 때 동적 자산 배분 엔진으로 분기
-                    if self.regime_engine.current_mode == MarketMode.B2_SWING:
-                        if not self.regime_engine.is_syncing:
+                    # StrategyManager 경유 — B3/B2 모드 + 동기화 상태 조회
+                    if self.strategy_mgr.is_b2:
+                        if not self.strategy_mgr.is_syncing:
                             await asyncio.to_thread(self._b2_alloc_cycle)
                     else:
                         await asyncio.to_thread(self._bucket2_cycle)
@@ -747,8 +760,8 @@ class Orchestrator:
         if is_high_volatility(vix or 0):
             return
 
-        target  = self.b2_alloc.rebalance()
-        budget  = self.bucket_capital.allocated("etf_swing")
+        target  = self.strategy_mgr.rebalance_b2()
+        budget  = self.account_mgr.capital_b2()
         cfg_b2  = self.cfg.get("etf_swing", {})
 
         # ── CASH 모드: 모든 B2 포지션 청산 ─────────────────────────
@@ -953,8 +966,8 @@ class Orchestrator:
         if last <= 0:
             return
 
-        # 신뢰도 점수 기반 예산 결정 (≥90→전액, 70~89→절반)
-        budget = self.bucket_capital.allocated_by_score("squeeze", conf.total)
+        # 신뢰도 점수 기반 예산 결정 — AccountManager 경유 (A/B + 점수 통합)
+        budget = self.account_mgr.capital_for("squeeze", conf.total)
         if budget <= 0:
             return
 

@@ -94,6 +94,20 @@ class BucketCapitalManager:
         """버킷에 할당된 최대 사용 가능 금액 (자금 격리 한도)."""
         return self.daily_group_equity * self.weights.get(bucket, 0.0)
 
+    def allocated_by_score(self, bucket: str, score: int) -> float:
+        """
+        신뢰도 점수 기반 자금 배분.
+
+        ≥ 90점: 버킷 전액 (capital_ratio = 1.0)
+        70~89점: 버킷 절반 (capital_ratio = 0.5)
+        < 70점: 0 (진입 금지)
+        """
+        if score >= 90:
+            return self.allocated(bucket)
+        if score >= 70:
+            return self.allocated(bucket) * 0.5
+        return 0.0
+
     def update_equity(self, new_equity: float) -> None:
         self.total_equity = new_equity
 

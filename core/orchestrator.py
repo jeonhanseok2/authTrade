@@ -30,7 +30,8 @@ from strategy.exits import (
     rsi_overbought_exit, eod_exit, bid_ask_spread_exit,
     breakeven_stop_hit, partial_exit_check,
 )
-from strategy.exit_strategy import ExitStrategyEngine, ExitDecision
+from strategy.exit_strategy      import ExitStrategyEngine, ExitDecision
+from strategy.confidence_scanner import ConfidenceScanner
 from storage.db import PositionDB
 
 # 인버스 ETF 헤지 종목
@@ -67,8 +68,12 @@ class Orchestrator:
         self._stream: Optional[Bucket3Stream] = None
         self._hedge_active: bool  = False  # Panic 헤지 포지션 보유 중 여부
 
-        # B3 급등주 전용 고도화 청산 엔진 (개미 털기 방어 + 가변 ATR)
-        self.exit_engine = ExitStrategyEngine(notify=self._notify)
+        # B3 고도화 청산 엔진 (개미 털기 방어 + 가변 ATR)
+        self.exit_engine       = ExitStrategyEngine(notify=self._notify)
+        # B3 신뢰도 스코어러 (RVOL/Alpha/VWAP 100점)
+        self.conf_scanner      = ConfidenceScanner()
+        # 종목별 3분 룰 체크 완료 여부 (당일 초기화 불필요 — 포지션 종료 시 제거)
+        self._3min_checked: set = set()
 
     # ──────────────────────────────────────────────────────────────────
     # 공통 유틸
@@ -259,12 +264,24 @@ class Orchestrator:
                     exit_reason = reason,
                     sector      = pos.get("sector", ""),
                 )
-                pnl = (price - float(pos["entry_price"])) * qty
-                pnl_hint = f"  PnL: {'+'if pnl>=0 else ''}${pnl:.2f}"
+                pnl     = (price - float(pos["entry_price"])) * qty
+                pnl_pct = (price - float(pos["entry_price"])) / float(pos["entry_price"]) * 100
+                pnl_hint = f"  PnL: {'+'if pnl>=0 else ''}${pnl:.2f} ({pnl_pct:+.1f}%)"
             else:
+                pnl_pct  = 0.0
                 pnl_hint = ""
 
-            self._notify(f"[{strategy.upper()}] {sym} 청산: {reason} @ ${price:.2f}{pnl_hint}")
+            # 청산 후 3분룰 상태 해제
+            self._3min_checked.discard(sym)
+            # 신뢰도 블랙리스트도 해제 (다음 진입 기회 허용)
+            self.conf_scanner.blacklist.clear(sym)
+
+            # 텔레그램: 매도 사유 + 최종 수익률 포함
+            self._notify(
+                f"📉 [{strategy.upper()}] {sym} 청산\n"
+                f"매도 사유: {reason}\n"
+                f"청산가: ${price:.2f}{pnl_hint}"
+            )
             logging.info("[EXIT] %s 청산: %s @ $%.2f%s", sym, reason, price, pnl_hint)
         except Exception as exc:
             logging.error("[EXIT] %s 청산 실패: %s", sym, exc)
@@ -306,6 +323,36 @@ class Orchestrator:
             if last > peak:
                 await asyncio.to_thread(self.db.update_peak, sym, last)
                 peak = last
+
+            # ── 3분 룰: 진입 후 3분 이내 수익 미달 → 절반 매도 ─────
+            if strategy == "squeeze" and sym not in self._3min_checked:
+                entry_ts_str = pos.get("entry_ts", "")
+                if entry_ts_str:
+                    try:
+                        from datetime import datetime, timezone
+                        entry_dt  = datetime.fromisoformat(entry_ts_str.replace("Z", "+00:00"))
+                        hold_mins = (now - entry_dt).total_seconds() / 60.0
+                        if 3.0 <= hold_mins <= 8.0:   # 3~8분 사이에 한 번만 판정
+                            self._3min_checked.add(sym)
+                            pnl_pct = (last - entry) / entry if entry > 0 else 0.0
+                            if pnl_pct <= 0.0:
+                                sell_qty = max(1, qty // 2)
+                                await asyncio.to_thread(
+                                    self._do_partial_exit, sym, qty, last,
+                                    partial_stage + 5, 0.5, strategy
+                                )
+                                qty = qty - sell_qty
+                                self._notify(
+                                    f"⚠️ [3분룰] {sym} 진입 {hold_mins:.1f}분 경과 수익 미달 "
+                                    f"({pnl_pct*100:+.1f}%) — 절반 매도"
+                                )
+                                logging.info("[EXIT][3분룰] %s hold=%.1f분 pnl=%.1f%% → 절반 매도",
+                                             sym, hold_mins, pnl_pct * 100)
+                                if qty <= 0 and self._stream:
+                                    self._stream.release(sym)
+                                    continue
+                    except Exception as _e:
+                        logging.debug("[EXIT][3분룰] %s ts 파싱 오류: %s", sym, _e)
 
             # ── 분할 청산 (B3 squeeze 전용) ──────────────────────────
             # partial_exits_enabled: false → 기계적 % 분할 비활성화
@@ -770,15 +817,29 @@ class Orchestrator:
         if not ok:
             return
 
-        # 스푸핑 블랙리스트 체크
+        # ── 스푸핑 블랙리스트 ────────────────────────────────────────
         if self._stream and hasattr(self._stream, "is_spoof_blacklisted"):
             if self._stream.is_spoof_blacklisted(symbol):
                 logging.info("[B3] %s 스푸핑 블랙리스트 — 진입 차단", symbol)
                 return
 
-        budget = self.bucket_capital.allocated("squeeze")
-        last   = await asyncio.to_thread(self._fetch_last, symbol)
+        # ── 신뢰도 스코어 (RVOL/Alpha/VWAP 100점) ───────────────────
+        if self.conf_scanner.is_blacklisted(symbol):
+            logging.debug("[B3] %s 신뢰도 블랙리스트 — 스킵", symbol)
+            return
+
+        conf = await asyncio.to_thread(self.conf_scanner.score, symbol, df)
+        if not conf.is_tradeable:
+            logging.info("[B3] %s 신뢰도 %d점 미달 (70점 기준) — 진입 차단", symbol, conf.total)
+            return
+
+        last = await asyncio.to_thread(self._fetch_last, symbol)
         if last <= 0:
+            return
+
+        # 신뢰도 점수 기반 예산 결정 (≥90→전액, 70~89→절반)
+        budget = self.bucket_capital.allocated_by_score("squeeze", conf.total)
+        if budget <= 0:
             return
 
         # 켈리 사이징: 최근 5회 승률 60%+ → 예산 1.2배
@@ -796,6 +857,7 @@ class Orchestrator:
         if qty <= 0:
             return
 
+        capital_label = "전액" if conf.capital_ratio >= 1.0 else "절반"
         try:
             ask = self._fetch_ask(symbol)
             buy_px = round(ask * 1.002, 4) if ask > 0 else None
@@ -808,7 +870,11 @@ class Orchestrator:
             await asyncio.to_thread(self.db.record_trade, symbol, "buy", qty, last, "squeeze", reason)
             if self._stream:
                 self._stream.hold([symbol])
-            self._notify(f"[B3] {symbol} 매수 {qty}주 @ ${last:.2f} | {reason}")
+            self._notify(
+                f"📈 [B3] {symbol} 매수 {qty}주 @ ${last:.2f}\n"
+                f"신뢰도 {conf.total}점 ({capital_label} ${budget:,.0f} 투입)\n"
+                f"근거: {reason}"
+            )
         except Exception as exc:
             logging.error("[B3] %s 주문 실패: %s", symbol, exc)
 

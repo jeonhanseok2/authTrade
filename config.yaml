@@ -131,3 +131,7 @@ sector:
 
 storage:
   db_path: "storage/trade.db"
+
+# cash → A/B 로테이션 활성 (T+1 결제 프리라이딩 방지)
+# ACCOUNT_TYPE 환경변수로 오버라이드 가능
+account_type: cash

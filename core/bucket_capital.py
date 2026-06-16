@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import date as _date
 from typing import Dict
 
 
@@ -41,9 +42,57 @@ class BucketCapitalManager:
         default_factory=lambda: {b: 0.0 for b in BUCKETS}, init=False,
     )
 
+    # ── A/B 로테이션 (Cash Account T+1 프리라이딩 방지) ──────────────────
+    _ab_mode:      bool  = field(default=False, init=False)
+    _settled_cash: float = field(default=0.0,   init=False)
+
+    # ── A/B 로테이션 API ─────────────────────────────────────────────────
+
+    def enable_ab_rotation(self, initial_equity: float | None = None) -> None:
+        """
+        Cash Account A/B 로테이션 활성화.
+
+        - Group A: 홀수 날 (odd day)
+        - Group B: 짝수 날 (even day)
+        - 각 그룹은 전체 자산의 절반만 사용 → T+1 결제 자금이
+          다음 그룹 순번 도래 전에 결제 완료됨 (프리라이딩 방지)
+        """
+        self._ab_mode = True
+        if initial_equity is not None:
+            self.total_equity = initial_equity
+        logging.info(
+            "[BucketCapital] A/B 로테이션 활성화 — 오늘 그룹: %s (총자산 $%.0f)",
+            self.active_group,
+            self.total_equity,
+        )
+
+    def update_settled_cash(self, amount: float) -> None:
+        """결제 완료 현금 갱신 (broker.get_settled_cash() 호출 결과)."""
+        self._settled_cash = max(0.0, amount)
+
+    @property
+    def active_group(self) -> str:
+        """오늘 날짜 홀짝으로 A/B 그룹 결정."""
+        return "A" if _date.today().day % 2 == 1 else "B"
+
+    @property
+    def daily_group_equity(self) -> float:
+        """
+        A/B 모드: min(total_equity/2, settled_cash).
+        일반 모드: total_equity.
+
+        settled_cash=0 이면 안전하게 0 반환 (당일 매매 차단).
+        """
+        if not self._ab_mode:
+            return self.total_equity
+        half = self.total_equity / 2.0
+        if self._settled_cash <= 0:
+            return 0.0
+        return min(half, self._settled_cash)
+
     def allocated(self, bucket: str) -> float:
         """버킷에 할당된 최대 사용 가능 금액 (자금 격리 한도)."""
-        return self.total_equity * self.weights.get(bucket, 0.0)
+        return self.daily_group_equity * self.weights.get(bucket, 0.0)
 
     def update_equity(self, new_equity: float) -> None:
         self.total_equity = new_equity

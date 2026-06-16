@@ -122,6 +122,12 @@ async def main() -> None:
     )
     bucket_capital = BucketCapitalManager(total_equity=max(equity, 1.0))
 
+    # ── Cash Account A/B 로테이션 ─────────────────────────────────────
+    account_type = os.getenv("ACCOUNT_TYPE", cfg.get("account_type", "margin")).lower()
+    if account_type == "cash":
+        bucket_capital.enable_ab_rotation(initial_equity=max(equity, 1.0))
+        logging.info("[MAIN] Cash Account 모드 — A/B 로테이션 활성 (그룹 %s)", bucket_capital.active_group)
+
     # ── 오케스트레이터 ────────────────────────────────────────────────
     orch = Orchestrator(
         broker=broker,

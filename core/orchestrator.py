@@ -444,6 +444,15 @@ class Orchestrator:
 
         self.bucket_capital.update_equity(acct.equity)
 
+        # A/B 로테이션: 결제 완료 현금 갱신 (Cash Account T+1)
+        if self.bucket_capital._ab_mode and hasattr(self.broker, "get_settled_cash"):
+            try:
+                settled = await asyncio.to_thread(self.broker.get_settled_cash)
+                self.bucket_capital.update_settled_cash(settled)
+                logging.debug("[MONITOR] 결제현금 갱신: $%.0f (그룹 %s)", settled, self.bucket_capital.active_group)
+            except Exception as _e:
+                logging.warning("[MONITOR] 결제현금 조회 실패: %s", _e)
+
         # 킬스위치 — 미실현 손익 기준
         killed = self.kill_switch.update(acct.equity, acct.day_pnl)
         if killed:

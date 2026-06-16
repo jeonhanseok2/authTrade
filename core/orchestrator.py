@@ -32,6 +32,8 @@ from strategy.exits import (
 )
 from strategy.exit_strategy      import ExitStrategyEngine, ExitDecision
 from strategy.confidence_scanner import ConfidenceScanner
+from core.regime_engine          import RegimeEngine, MarketMode
+from strategy.b2_allocation      import B2AllocationEngine, B2AllocMode
 from storage.db import PositionDB
 
 # 인버스 ETF 헤지 종목
@@ -72,7 +74,11 @@ class Orchestrator:
         self.exit_engine       = ExitStrategyEngine(notify=self._notify)
         # B3 신뢰도 스코어러 (RVOL/Alpha/VWAP 100점)
         self.conf_scanner      = ConfidenceScanner()
-        # 종목별 3분 룰 체크 완료 여부 (당일 초기화 불필요 — 포지션 종료 시 제거)
+        # 외부 레짐 엔진 (B3_AGGRESSIVE vs B2_SWING, 매일 9:20 ET 스캔)
+        self.regime_engine     = RegimeEngine(notify=self._notify)
+        # B2 내부 동적 자산 배분 엔진 (BULL_LEVERAGE/DEFENSE_INDEX/CASH)
+        self.b2_alloc          = B2AllocationEngine(notify=self._notify)
+        # 종목별 3분 룰 체크 완료 여부 (포지션 청산 시 제거)
         self._3min_checked: set = set()
 
     # ──────────────────────────────────────────────────────────────────
@@ -366,6 +372,21 @@ class Orchestrator:
                     )
                     qty = max(1, qty - int(qty * sell_ratio))
                     partial_stage = new_stage
+
+            # ── B2 방어 모드: 주봉 20주 MA 이탈 시 청산 ─────────────────
+            if strategy == "etf_swing" and self.b2_alloc.current_mode == B2AllocMode.CASH:
+                await asyncio.to_thread(self._do_exit, sym, qty, last, "b2_cash_protection", strategy)
+                continue
+
+            if strategy == "etf_swing":
+                from strategy.b2_allocation import B2AllocMode as _B2M
+                if self.b2_alloc.current_mode == _B2M.DEFENSE_INDEX:
+                    wk_exit, wk_reason = await asyncio.to_thread(
+                        self.b2_alloc.check_weekly_exit, sym
+                    )
+                    if wk_exit:
+                        await asyncio.to_thread(self._do_exit, sym, qty, last, wk_reason, strategy)
+                        continue
 
             # ── ExitStrategyEngine: B3 고도화 청산 (가변 ATR + 개미 털기 방어) ─
             # hard_stop / stop_loss / distribution 은 _check_exit_reason 에서 처리.
@@ -699,10 +720,105 @@ class Orchestrator:
         while True:
             try:
                 if self._is_tradeable():
-                    await asyncio.to_thread(self._bucket2_cycle)
+                    # B2_SWING 모드일 때 동적 자산 배분 엔진으로 분기
+                    if self.regime_engine.current_mode == MarketMode.B2_SWING:
+                        if not self.regime_engine.is_syncing:
+                            await asyncio.to_thread(self._b2_alloc_cycle)
+                    else:
+                        await asyncio.to_thread(self._bucket2_cycle)
             except Exception as exc:
                 logging.error("[B2] 예외: %s", exc)
             await asyncio.sleep(900)
+
+    def _b2_alloc_cycle(self) -> None:
+        """
+        B2 동적 자산 배분 사이클 (B2_SWING 모드).
+
+        B2AllocationEngine.rebalance() 결과에 따라:
+          BULL_LEVERAGE → 레버리지 ETF 상위 2개 진입
+          DEFENSE_INDEX → 지수 ETF 1개 진입
+          CASH          → 모든 B2 포지션 청산
+        """
+        from strategy.etf_swing       import swing_b2_entry, B2_LEVERAGE_UNIVERSE, B2_DEFENSE_UNIVERSE
+        from strategy.b2_allocation   import B2AllocMode
+        from strategy.regime          import fetch_vix, is_high_volatility
+
+        vix = fetch_vix()
+        if is_high_volatility(vix or 0):
+            return
+
+        target  = self.b2_alloc.rebalance()
+        budget  = self.bucket_capital.allocated("etf_swing")
+        cfg_b2  = self.cfg.get("etf_swing", {})
+
+        # ── CASH 모드: 모든 B2 포지션 청산 ─────────────────────────
+        if target.mode == B2AllocMode.CASH:
+            positions = self.db.list_open_positions()
+            for pos in positions:
+                if pos.get("strategy") != "etf_swing":
+                    continue
+                sym  = pos["symbol"]
+                qty  = int(pos.get("qty", 0))
+                last = self._fetch_last(sym)
+                if last > 0 and qty > 0:
+                    self._do_exit(sym, qty, last, "b2_cash_protection", "etf_swing")
+            return
+
+        # ── 기존 B2 포지션 중 목표 포트폴리오에 없는 것 청산 ─────────
+        positions = self.db.list_open_positions()
+        for pos in positions:
+            if pos.get("strategy") != "etf_swing":
+                continue
+            sym = pos["symbol"]
+            if sym not in target.symbols:
+                qty  = int(pos.get("qty", 0))
+                last = self._fetch_last(sym)
+                if last > 0 and qty > 0:
+                    self._do_exit(sym, qty, last, "b2_rebalance_exit", "etf_swing")
+
+        # ── 신규 목표 포지션 진입 ────────────────────────────────────
+        for sym in target.symbols:
+            if self.db.get_open_position(sym):
+                continue   # 이미 보유 중
+
+            df = self._fetch_bars(sym, "1Day", 60)
+            if df is None:
+                continue
+
+            # B2 전용 MA20+RSI30 진입 판단 (3분룰 없음)
+            ok, reason, trailing_stop = swing_b2_entry(sym, df)
+            if not ok:
+                logging.debug("[B2-Alloc] %s 진입 조건 미충족: %s", sym, reason)
+                continue
+
+            last = self._fetch_last(sym)
+            if last <= 0:
+                continue
+
+            weight = target.weights.get(sym, 0.5)
+            qty    = self._calc_qty(last, budget * weight)
+            if qty <= 0:
+                continue
+
+            try:
+                ask    = self._fetch_ask(sym)
+                buy_px = round(ask * 1.002, 4) if ask > 0 else None
+                self.broker.submit_order(
+                    symbol=sym, qty=qty, side="buy",
+                    type="limit" if buy_px else "market",
+                    price=buy_px, tif="IOC",
+                )
+                self.db.open_position(sym, "etf_swing", last, qty, "")
+                self.db.record_trade(sym, "buy", qty, last, "etf_swing", reason)
+                alloc_desc = target.reasons.get(sym, "")
+                self._notify(
+                    f"📊 [B2-{'공격' if target.mode == B2AllocMode.BULL_LEVERAGE else '방어'}] "
+                    f"{sym} 매수 {qty}주 @ ${last:.2f}\n"
+                    f"배분: {weight*100:.0f}% | {alloc_desc}\n"
+                    f"근거: {reason}"
+                )
+            except Exception as exc:
+                logging.error("[B2-Alloc] %s 주문 실패: %s", sym, exc)
 
     def _bucket2_cycle(self) -> None:
         from analysis.market    import analyze_market

@@ -180,8 +180,10 @@ async def main() -> None:
         orch.run_exit_loop(),              # 30초 — 전 버킷 청산 체크
         orch.run_monitor_loop(),           # 60초 — 킬스위치 + VIX RoC
         orch.run_bucket1_loop(b1_syms),    # 60분 — 가치주 장기
-        orch.run_bucket2_loop(),           # 15분 — ETF 스윙
+        orch.run_bucket2_loop(),           # 15분 — ETF 스윙 (or B2 동적 배분)
         orch.run_bucket3_stream(b3_syms),  # B3 — PollingStream(Toss) / WebSocket(Alpaca)
+        # 매일 9:20 ET 프리마켓 스캔 → B3/B2 외부 레짐 전환
+        orch.regime_engine.run_premarket_loop(b3_syms, orch.conf_scanner),
     ]
     # Toss 브로커: 세션 감시 워치독 추가 (세션 끊기면 킬스위치 + 텔레그램)
     if broker_type == "toss" and mode == "live":

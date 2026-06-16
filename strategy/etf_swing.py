@@ -240,3 +240,95 @@ def get_etf_candidates(market: MarketRegime) -> list[str]:
         candidates += ["GLD", "TLT"]
 
     return list(dict.fromkeys(candidates))  # 중복 제거, 순서 유지
+
+
+# ─────────────────────────────────────────────────────────────────────
+# B2 스윙 모드 전용 — MA20 + RSI30 과매도 반등 진입
+# 외부(B3 vs B2) 레짐은 RegimeEngine 이 결정하며,
+# 이 함수는 B2_SWING 내부의 구체적 진입 타점을 계산합니다.
+# ─────────────────────────────────────────────────────────────────────
+
+# B2 공격 모드: 레버리지 ETF (bull market)
+B2_LEVERAGE_UNIVERSE: list[str] = ["TQQQ", "SOXL", "FNGU"]
+# B2 방어 모드: 지수 ETF (correction/sideways)
+B2_DEFENSE_UNIVERSE:  list[str] = ["QQQ", "SPY"]
+
+
+def swing_b2_entry(
+    symbol:     str,
+    df:         pd.DataFrame,   # 일봉 (최소 25일 이상 권장)
+    atr:        float = 0.0,    # ATR 값 (0이면 추정치 사용)
+) -> tuple[bool, str, float]:
+    """
+    B2 스윙 진입 판단 — MA20 지지 + RSI(30) 과매도 반등.
+
+    진입 조건:
+      1. 현재가 ≥ MA20 (추세 유지 확인)
+      2. 최근 RSI < 35 (과매도 구간 진입)
+      3. 현재봉 close > 이전봉 close (반등 시작 확인)
+      4. 거래량 > 20일 평균 (매수세 동반 확인)
+
+    Returns:
+        (should_enter, reason, atr_trailing_stop_price)
+        trailing_stop = current_price - atr × 1.5
+    """
+    if df is None or len(df) < 20:
+        return False, "데이터 부족 (20일 이상 필요)", 0.0
+
+    if "rsi_14" not in df.columns or "sma_10" not in df.columns:
+        df = compute_indicators(df)
+
+    last  = df.iloc[-1]
+    prev  = df.iloc[-2]
+
+    close      = float(last.get("close", 0) or 0)
+    prev_close = float(prev.get("close", 0) or 0)
+    rsi        = float(last.get("rsi_14", 50) or 50)
+    prev_rsi   = float(prev.get("rsi_14", 50) or 50)
+    vol        = float(last.get("volume", 0) or 0)
+    vol_ma     = float(last.get("vol_ma20", 1) or 1)
+
+    # MA20 계산 (sma_50이 없으면 rolling 직접 계산)
+    if "sma_20" in df.columns:
+        ma20 = float(last.get("sma_20", 0) or 0)
+    else:
+        ma20 = float(df["close"].rolling(20, min_periods=10).mean().iloc[-1] or 0)
+
+    if close <= 0 or ma20 <= 0:
+        return False, "가격/MA20 데이터 없음", 0.0
+
+    # 조건 1: 현재가 >= MA20
+    if close < ma20:
+        return False, f"MA20 하방 (${close:.2f} < MA20 ${ma20:.2f}) — 방어 진입 차단", 0.0
+
+    # 조건 2: 직전봉 RSI < 35 (과매도 확인)
+    if prev_rsi >= 35:
+        return False, f"RSI 과매도 미충족 (직전 RSI {prev_rsi:.1f} >= 35)", 0.0
+
+    # 조건 3: 현재봉 반등 확인
+    if close <= prev_close:
+        return False, "반등 미확인 (현재봉 close ≤ 직전봉)", 0.0
+
+    # 조건 4: 거래량 확인
+    if vol_ma > 0 and vol < vol_ma * 0.8:
+        return False, f"거래량 부족 ({vol/vol_ma:.1f}x)", 0.0
+
+    # ATR 트레일링 스탑 (ATR×1.5)
+    if atr <= 0:
+        # ATR 추정: 최근 14봉 TR 평균
+        try:
+            hi = df["high"].tail(14)
+            lo = df["low"].tail(14)
+            cl = df["close"].shift(1).tail(14)
+            tr = pd.concat([hi - lo, (hi - cl).abs(), (lo - cl).abs()], axis=1).max(axis=1)
+            atr = float(tr.mean() or 0)
+        except Exception:
+            atr = close * 0.02   # 2% 추정 fallback
+
+    trailing_stop = max(close - atr * 1.5, close * 0.92)   # 최소 -8% 하드플로어
+
+    reason = (
+        f"B2 스윙 진입 — MA20 지지(${ma20:.2f}) + RSI 반등({prev_rsi:.0f}→{rsi:.0f}), "
+        f"거래량 {vol/vol_ma:.1f}x, ATR×1.5 스탑 ${trailing_stop:.2f}"
+    )
+    return True, reason, trailing_stop

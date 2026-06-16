@@ -163,6 +163,46 @@ system_state  key('CURRENT_MODE'|'ACTIVE_GROUP'|'B2_ALLOC_MODE'), value
 
 ---
 
+## Paper Trading 모드
+
+실제 자금 없이 알파카 Paper API로 전략 검증.
+
+### 슬리피지 시뮬레이션
+
+Paper 모드는 체결이 지나치게 유리하게 되는 경향이 있어 현실적 수익률 보정을 적용합니다.
+
+| 구분 | Paper | Live |
+|------|-------|------|
+| 매수가 | `last × 1.001` (+0.1%) | `ask × 1.002` (+0.2%) |
+| 매도가 (일반) | `price × 0.999` (-0.1%) | `price × 0.997` (-0.3%) |
+| 매도가 (손절/긴급) | `price × 0.999` (-0.1%) | `price × 0.995` (-0.5%) |
+
+### 예수금 확인 (T+1 프리라이딩 방지)
+
+- **B3 진입 직전**: 신뢰도 스코어 통과 후 `refresh_settled_cash()` 호출 → 최신 결제 가능 현금으로 예산 재산정
+- **B2 배분 사이클 상단**: `get_settled_cash()` 직접 조회 → $0이면 즉시 차단
+
+### 실시간 DB 기록 (`storage/db/trading_data.db`)
+
+- 매수 진입 시: `trades` 테이블에 `sell_price=NULL, result=NULL` 기록
+- 청산 시: 동일 행을 완성된 거래로 기록 (`sell_price`, `result` 채움)
+- 모드 전환: `system_state` 테이블에 `CURRENT_MODE` 갱신
+
+### 텔레그램 알림
+
+모든 매매 알림에 `[PAPER]`/`[LIVE]` 레이블 포함:
+```
+📈 [B3/PAPER] NVDA 매수 10주 @ $875.50
+신뢰도 88점 (절반 $3,200 투입)
+근거: Gap&Go — 9분 고점 돌파
+
+📉 [SQUEEZE/PAPER] NVDA 청산
+매도 사유: trailing_stop
+청산가: $891.20  PnL: +$157.00 (+1.8%)
+```
+
+---
+
 ## 설치 & 실행
 
 ```bash
@@ -289,4 +329,5 @@ python -m backtest.run --bucket etf_swing --cash 50000 --csv results/etf.csv
 | 5분봉 | 60일 | B3 급등주 |
 | 일봉 | 5년+ | B1, B2 |
 
-> 슬리피지 미반영 — 실전 수익은 5~10% 낮게 산정 권장
+> 슬리피지 미반영 — 실전 수익은 5~10% 낮게 산정 권장  
+> Paper Trading 모드 (`MODE=paper`) 실행 시 매수 +0.1% / 매도 -0.1% 자동 적용

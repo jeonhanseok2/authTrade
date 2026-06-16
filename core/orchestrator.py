@@ -39,6 +39,8 @@ from core.StrategyManager        import StrategyManager
 from core.AccountManager         import AccountManager
 from strategy.news_analyzer      import NewsAnalyzer
 from storage.db import PositionDB
+import os
+import storage.db_manager as dbm
 
 # 인버스 ETF 헤지 종목
 PANIC_HEDGE_ETFS = ["SQQQ", "SDS"]
@@ -48,6 +50,10 @@ VIX_ROC_THRESHOLD = 0.20
 # 지정가 청산 슬리피지 (토스 시장가 슬리피지 방지)
 _EXIT_LIMIT_SLIP = 0.003   # 일반 청산: 현재가 -0.3%
 _STOP_LIMIT_SLIP = 0.005   # 손절/긴급: 현재가 -0.5%
+
+# Paper Trading 슬리피지 시뮬레이션 (매수 +0.1%, 매도 -0.1%)
+_PAPER_SLIP_BUY  = 0.001
+_PAPER_SLIP_SELL = 0.001
 
 
 class Orchestrator:
@@ -148,6 +154,9 @@ class Orchestrator:
 
     def _is_toss(self) -> bool:
         return hasattr(self.broker, "get_candles")  # TossInvestBroker 판별
+
+    def _is_paper(self) -> bool:
+        return os.getenv("MODE", "paper").lower() == "paper"
 
     def _fetch_last(self, symbol: str) -> float:
         try:
@@ -255,7 +264,8 @@ class Orchestrator:
         sell_qty = max(1, int(qty * sell_ratio))
         remain   = qty - sell_qty
         try:
-            limit_px = round(price * (1 - _EXIT_LIMIT_SLIP), 4)
+            slip_p   = _PAPER_SLIP_SELL if self._is_paper() else _EXIT_LIMIT_SLIP
+            limit_px = round(price * (1 - slip_p), 4)
             self.broker.submit_order(symbol=sym, qty=sell_qty, side="sell", type="limit", price=limit_px)
             self.db.update_partial_stage(sym, new_stage, remain)
             self.db.record_trade(sym, "sell", sell_qty, price, strategy,
@@ -275,9 +285,12 @@ class Orchestrator:
             # 청산 전 포지션 정보 조회 (closed_trades 기록용)
             pos = self.db.get_open_position(sym)
 
-            # 손절/하드스탑은 넓은 슬리피지, 그 외는 타이트
+            # 손절/하드스탑은 넓은 슬리피지, 그 외는 타이트 (Paper: 균일 0.1%)
             urgent = reason in ("stop_loss", "hard_stop_gap_down", "breakeven_stop")
-            slip   = _STOP_LIMIT_SLIP if urgent else _EXIT_LIMIT_SLIP
+            if self._is_paper():
+                slip = _PAPER_SLIP_SELL
+            else:
+                slip = _STOP_LIMIT_SLIP if urgent else _EXIT_LIMIT_SLIP
             limit_px = round(price * (1 - slip), 4)
             self.broker.submit_order(symbol=sym, qty=qty, side="sell", type="limit", price=limit_px)
             self.db.close_position(sym)
@@ -299,6 +312,16 @@ class Orchestrator:
                 pnl     = (price - float(pos["entry_price"])) * qty
                 pnl_pct = (price - float(pos["entry_price"])) / float(pos["entry_price"]) * 100
                 pnl_hint = f"  PnL: {'+'if pnl>=0 else ''}${pnl:.2f} ({pnl_pct:+.1f}%)"
+                # db_manager: 사계절 엔진 trades 테이블에 실시간 기록
+                try:
+                    dbm.save_trade(
+                        symbol=sym, buy_price=float(pos["entry_price"]),
+                        sell_price=price, quantity=qty,
+                        mode=f"{strategy}|{reason}",
+                        result=round(pnl_pct, 2),
+                    )
+                except Exception:
+                    pass
             else:
                 pnl_pct  = 0.0
                 pnl_hint = ""
@@ -309,8 +332,9 @@ class Orchestrator:
             self.conf_scanner.blacklist.clear(sym)
 
             # 텔레그램: 매도 사유 + 최종 수익률 포함
+            mode_label = "PAPER" if self._is_paper() else "LIVE"
             self._notify(
-                f"📉 [{strategy.upper()}] {sym} 청산\n"
+                f"📉 [{strategy.upper()}/{mode_label}] {sym} 청산\n"
                 f"매도 사유: {reason}\n"
                 f"청산가: ${price:.2f}{pnl_hint}"
             )
@@ -715,8 +739,11 @@ class Orchestrator:
                 continue
 
             try:
-                ask = self._fetch_ask(sym)
-                buy_px = round(ask * 1.002, 4) if ask > 0 else None
+                if self._is_paper():
+                    buy_px = round(last * (1 + _PAPER_SLIP_BUY), 4)
+                else:
+                    ask = self._fetch_ask(sym)
+                    buy_px = round(ask * 1.002, 4) if ask > 0 else None
                 self.broker.submit_order(
                     symbol=sym, qty=qty, side="buy",
                     type="limit" if buy_px else "market",
@@ -724,7 +751,15 @@ class Orchestrator:
                 )
                 self.db.open_position(sym, "value_long", last, qty, getattr(fs, "sector", ""))
                 self.db.record_trade(sym, "buy", qty, last, "value_long", reason)
-                self._notify(f"[B1] {sym} 매수 {qty}주 @ ${last:.2f} | {reason}")
+                try:
+                    dbm.save_trade(
+                        symbol=sym, buy_price=last, sell_price=None,
+                        quantity=qty, mode="B1-Value", result=None,
+                    )
+                except Exception:
+                    pass
+                mode_label = "PAPER" if self._is_paper() else "LIVE"
+                self._notify(f"[B1/{mode_label}] {sym} 매수 {qty}주 @ ${last:.2f} | {reason}")
                 b1_count += 1
             except Exception as exc:
                 logging.error("[B1] %s 주문 실패: %s", sym, exc)
@@ -760,6 +795,18 @@ class Orchestrator:
         from strategy.etf_swing       import swing_b2_entry, B2_LEVERAGE_UNIVERSE, B2_DEFENSE_UNIVERSE
         from strategy.b2_allocation   import B2AllocMode
         from strategy.regime          import fetch_vix, is_high_volatility
+
+        # 매매 전 예수금 실시간 재확인 (T+1 프리라이딩 방지)
+        if not self._is_toss():
+            try:
+                settled = self.broker.get_settled_cash()
+                self.bucket_capital.update_settled_cash(settled)
+                logging.info("[B2] 예수금 재확인: $%.0f", settled)
+                if settled <= 0:
+                    logging.info("[B2] 예수금 $0 — 매매 차단")
+                    return
+            except Exception as exc:
+                logging.debug("[B2] 예수금 조회 실패: %s", exc)
 
         vix = fetch_vix()
         if is_high_volatility(vix or 0):
@@ -819,8 +866,11 @@ class Orchestrator:
                 continue
 
             try:
-                ask    = self._fetch_ask(sym)
-                buy_px = round(ask * 1.002, 4) if ask > 0 else None
+                if self._is_paper():
+                    buy_px = round(last * (1 + _PAPER_SLIP_BUY), 4)
+                else:
+                    ask    = self._fetch_ask(sym)
+                    buy_px = round(ask * 1.002, 4) if ask > 0 else None
                 self.broker.submit_order(
                     symbol=sym, qty=qty, side="buy",
                     type="limit" if buy_px else "market",
@@ -828,9 +878,17 @@ class Orchestrator:
                 )
                 self.db.open_position(sym, "etf_swing", last, qty, "")
                 self.db.record_trade(sym, "buy", qty, last, "etf_swing", reason)
+                try:
+                    dbm.save_trade(
+                        symbol=sym, buy_price=last, sell_price=None,
+                        quantity=qty, mode=f"B2-Alloc|{target.mode.value}", result=None,
+                    )
+                except Exception:
+                    pass
                 alloc_desc = target.reasons.get(sym, "")
+                mode_label = "PAPER" if self._is_paper() else "LIVE"
                 self._notify(
-                    f"📊 [B2-{'공격' if target.mode == B2AllocMode.BULL_LEVERAGE else '방어'}] "
+                    f"📊 [B2-{'공격' if target.mode == B2AllocMode.BULL_LEVERAGE else '방어'}/{mode_label}] "
                     f"{sym} 매수 {qty}주 @ ${last:.2f}\n"
                     f"배분: {weight*100:.0f}% | {alloc_desc}\n"
                     f"근거: {reason}"
@@ -882,8 +940,11 @@ class Orchestrator:
                 continue
 
             try:
-                ask = self._fetch_ask(sym)
-                buy_px = round(ask * 1.002, 4) if ask > 0 else None
+                if self._is_paper():
+                    buy_px = round(last * (1 + _PAPER_SLIP_BUY), 4)
+                else:
+                    ask = self._fetch_ask(sym)
+                    buy_px = round(ask * 1.002, 4) if ask > 0 else None
                 self.broker.submit_order(
                     symbol=sym, qty=qty, side="buy",
                     type="limit" if buy_px else "market",
@@ -891,7 +952,15 @@ class Orchestrator:
                 )
                 self.db.open_position(sym, "etf_swing", last, qty, "ETF")
                 self.db.record_trade(sym, "buy", qty, last, "etf_swing", reason)
-                self._notify(f"[B2] {sym} 매수 {qty}주 @ ${last:.2f} | {reason}")
+                try:
+                    dbm.save_trade(
+                        symbol=sym, buy_price=last, sell_price=None,
+                        quantity=qty, mode="B2-ETF", result=None,
+                    )
+                except Exception:
+                    pass
+                mode_label = "PAPER" if self._is_paper() else "LIVE"
+                self._notify(f"[B2/{mode_label}] {sym} 매수 {qty}주 @ ${last:.2f} | {reason}")
                 b2_count += 1
             except Exception as exc:
                 logging.error("[B2] %s 주문 실패: %s", sym, exc)
@@ -971,6 +1040,10 @@ class Orchestrator:
         if last <= 0:
             return
 
+        # 진입 전 예수금 실시간 재확인 (T+1 프리라이딩 방지)
+        if not self._is_toss():
+            await self.account_mgr.refresh_settled_cash(self.broker)
+
         # 신뢰도 점수 기반 예산 결정 — AccountManager 경유 (A/B + 점수 통합)
         budget = self.account_mgr.capital_for("squeeze", conf.total)
         if budget <= 0:
@@ -993,8 +1066,11 @@ class Orchestrator:
 
         capital_label = "전액" if conf.capital_ratio >= 1.0 else "절반"
         try:
-            ask = self._fetch_ask(symbol)
-            buy_px = round(ask * 1.002, 4) if ask > 0 else None
+            if self._is_paper():
+                buy_px = round(last * (1 + _PAPER_SLIP_BUY), 4)
+            else:
+                ask = self._fetch_ask(symbol)
+                buy_px = round(ask * 1.002, 4) if ask > 0 else None
             self.broker.submit_order(
                 symbol=symbol, qty=qty, side="buy",
                 type="limit" if buy_px else "market",
@@ -1002,10 +1078,18 @@ class Orchestrator:
             )
             await asyncio.to_thread(self.db.open_position, symbol, "squeeze", last, qty, "")
             await asyncio.to_thread(self.db.record_trade, symbol, "buy", qty, last, "squeeze", reason)
+            try:
+                dbm.save_trade(
+                    symbol=symbol, buy_price=last, sell_price=None,
+                    quantity=qty, mode=f"B3|{conf.total}pt", result=None,
+                )
+            except Exception:
+                pass
             if self._stream:
                 self._stream.hold([symbol])
+            mode_label = "PAPER" if self._is_paper() else "LIVE"
             self._notify(
-                f"📈 [B3] {symbol} 매수 {qty}주 @ ${last:.2f}\n"
+                f"📈 [B3/{mode_label}] {symbol} 매수 {qty}주 @ ${last:.2f}\n"
                 f"신뢰도 {conf.total}점 ({capital_label} ${budget:,.0f} 투입)\n"
                 f"근거: {reason}"
             )

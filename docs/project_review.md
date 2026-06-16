@@ -1,5 +1,5 @@
 # authTrade — 사계절 퀀트 엔진 구조 및 매매 원칙 요약
-> 교차 검증용 문서. 최종 업데이트: 2026-06-16
+> 교차 검증용 문서. 최종 업데이트: 2026-06-16 (Paper Trading 준비 반영)
 
 ---
 
@@ -176,7 +176,60 @@ system_state (key PK, value)
 
 ---
 
-## 8. 텔레그램 명령어
+## 8. Paper Trading 모드
+
+### 슬리피지 시뮬레이션
+
+| 구분 | Paper | Live |
+|------|-------|------|
+| 매수가 | `last × 1.001` (+0.1%) | `ask × 1.002` (+0.2%) |
+| 매도가 (일반) | `price × 0.999` (-0.1%) | `price × 0.997` (-0.3%) |
+| 매도가 (손절/긴급) | `price × 0.999` (-0.1%) | `price × 0.995` (-0.5%) |
+
+판별: `os.getenv("MODE", "paper") == "paper"` → `_is_paper()` 메서드
+
+### 예수금 실시간 확인
+
+```python
+# on_bar() — B3 진입 직전 (async)
+await account_mgr.refresh_settled_cash(broker)
+budget = account_mgr.capital_for("squeeze", conf.total)
+
+# _b2_alloc_cycle() — B2 사이클 상단 (sync)
+settled = broker.get_settled_cash()
+bucket_capital.update_settled_cash(settled)
+if settled <= 0:
+    return  # 매매 차단
+```
+
+### 실시간 DB 기록 (`storage/db_manager.py`)
+
+```python
+# 매수 진입
+dbm.save_trade(symbol, buy_price=last, sell_price=None, quantity=qty, mode="B3|88pt", result=None)
+
+# 청산
+dbm.save_trade(symbol, buy_price=entry, sell_price=price, quantity=qty,
+               mode="squeeze|trailing_stop", result=round(pnl_pct, 2))
+```
+
+### 시작 검증 (`main.py`)
+
+```python
+dbm.init_db()   # storage/db/trading_data.db 자동 생성
+# MODE=paper + ALPACA_BASE_URL=실전 엔드포인트 → AssertionError 조기 차단
+```
+
+### Telegram 알림 형식
+
+```
+📈 [B3/PAPER] NVDA 매수 10주 @ $875.50
+📉 [SQUEEZE/PAPER] NVDA 청산  매도 사유: trailing_stop  청산가: $891.20  PnL: +$157.00 (+1.8%)
+```
+
+---
+
+## 10. 텔레그램 명령어
 
 | 명령어 | 기능 |
 |--------|------|
@@ -193,7 +246,7 @@ system_state (key PK, value)
 
 ---
 
-## 9. 데이터 흐름
+## 11. 데이터 흐름
 
 ```
 Alpaca Markets API   → 실시간 가격/거래량/뉴스
@@ -208,7 +261,7 @@ Telegram Bot         → 실시간 알림 + 수동 제어
 
 ---
 
-## 10. 핵심 파일 목록
+## 12. 핵심 파일 목록
 
 | 경로 | 역할 |
 |------|------|

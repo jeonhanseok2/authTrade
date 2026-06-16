@@ -117,6 +117,10 @@ async def main() -> None:
 
     # ── 인프라 초기화 ─────────────────────────────────────────────────
     db          = PositionDB(cfg["storage"]["db_path"])
+
+    # 사계절 엔진 DB 초기화 (storage/db/trading_data.db)
+    from storage import db_manager as _dbm
+    _dbm.init_db()
     kill_switch = KillSwitch(
         daily_loss_limit_pct=float(cfg.get("risk", {}).get("daily_loss_limit_pct", 0.02))
     )
@@ -169,6 +173,12 @@ async def main() -> None:
     # ── 시작 로그 ─────────────────────────────────────────────────────
     logging.info("=" * 60)
     logging.info("authTrade 시작 [%s / %s] — 계좌잔고 $%.0f", broker_type.upper(), label, equity)
+    if mode == "paper" and broker_type != "toss":
+        paper_url = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+        logging.info("[PAPER] 엔드포인트: %s", paper_url)
+        assert "paper-api.alpaca.markets" in paper_url or paper_url != "https://api.alpaca.markets", \
+            "ALPACA_BASE_URL이 실전 엔드포인트입니다. MODE=paper와 불일치합니다."
+        logging.warning("[PAPER] 실제 자금 이동 없음 — Paper Trading 모드로 실행 중")
     logging.info(
         "버킷 초기비중: B1=%.0f%% B2=%.0f%% B3=%.0f%%",
         bucket_capital.weights["value_long"] * 100,

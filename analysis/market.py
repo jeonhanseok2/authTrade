@@ -27,7 +27,7 @@ _INDEX_TICKERS = {
     "DOW":     "^DJI",    # 다우존스
     "VIX":     "^VIX",    # 공포지수
     "T10Y":    "^TNX",    # 미국 10년물 국채금리
-    "T2Y":     "^TUX",    # 미국 2년물 (없을 경우 SHY ETF로 대체)
+    "T13W":    "^IRX",    # 미국 13주 T-Bill (단기 금리 프록시 — Yahoo Finance에 2년물 티커 없음)
 }
 
 # 섹터 ETF 매핑 (SPDR 기준)

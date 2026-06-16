@@ -66,11 +66,16 @@ _PRO_TASKS = {
     GeminiTask.RISK_OVERRIDE,
 }
 
-# 시스템 프롬프트 — 공통
+# 시스템 프롬프트 — GenerativeModel(system_instruction=...) 에 전달
+# 사용자 프롬프트와 분리하면 역할 준수율이 높아지고 토큰도 절약됨
 _SYSTEM_PROMPT = (
     "당신은 미국 주식 자동매매 시스템의 AI 어드바이저입니다.\n"
-    "전문 트레이더 수준의 분석을 한국어로 제공하세요.\n"
-    "답변은 간결하고 실행 가능한 내용으로 작성하세요."
+    "전문 퀀트 트레이더 수준의 분석을 한국어로 제공하세요.\n"
+    "규칙:\n"
+    "1. 반드시 제공된 수치 데이터에 근거해서만 판단하세요.\n"
+    "2. 데이터가 없는 항목은 추측하지 말고 '(데이터 부족)'으로 표기하세요.\n"
+    "3. 답변은 간결하고 즉시 실행 가능한 내용으로 작성하세요.\n"
+    "4. 투자 조언이 아닌 시스템 파라미터 최적화 관점으로 답하세요."
 )
 
 
@@ -124,20 +129,22 @@ def call_gemini(
     try:
         genai = _get_client()
 
-        # 시스템 프롬프트 + 컨텍스트 결합
-        full_prompt = _SYSTEM_PROMPT
-        if context:
-            full_prompt += f"\n\n현재 컨텍스트:\n{context}"
-        full_prompt += f"\n\n{prompt}"
-
+        # system_instruction 분리 — 역할 준수율 향상
         model = genai.GenerativeModel(
-            model_name=model_name,
-            generation_config={
-                "temperature":     temperature,
+            model_name         = model_name,
+            system_instruction = _SYSTEM_PROMPT,
+            generation_config  = {
+                "temperature":       temperature,
                 "max_output_tokens": max_tokens,
             },
         )
-        response = model.generate_content(full_prompt)
+
+        # 사용자 메시지: 컨텍스트 + 실제 프롬프트
+        user_content = prompt
+        if context:
+            user_content = f"[현재 컨텍스트]\n{context}\n\n{prompt}"
+
+        response = model.generate_content(user_content)
         return response.text.strip() if response.text else None
 
     except Exception as exc:

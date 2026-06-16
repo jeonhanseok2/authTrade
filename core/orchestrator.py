@@ -608,29 +608,31 @@ class Orchestrator:
             return
 
         from analysis.market  import analyze_market
-        from strategy.scanner import GapCandidate
+        from strategy.scanner import GapCandidate, vwap_pullback_entry
         from strategy.squeeze import gap_and_go_squeeze_entry
 
         regime    = await asyncio.to_thread(analyze_market)
         close_val = float(getattr(bar, "close", 0) or 0)
-        candidate = GapCandidate(
-            symbol=symbol, gap_pct=0.0, rvol=0.0,
-            float_shares=0, short_pct_float=0.0,
-            days_to_cover=0.0, price=close_val,
-            atr=0.0, score=50.0,
-        )
+        # GapCandidate 생성 — 실시간 bar라 갭/RVOL 정보 없음 (기본값 0)
+        candidate = GapCandidate(symbol=symbol, atr=0.0, score=50.0)
 
+        # ── 1차 진입: Gap&Go (첫 5분봉 고점 돌파) ────────────────
         ok, price, stop, reason = await asyncio.to_thread(
             gap_and_go_squeeze_entry, symbol, df, candidate, regime
         )
-        if not ok:
-            return
 
-        # VWAP 필터 — 현재가 < VWAP이면 갭앤크랩 위험 → 진입 차단
-        from strategy.scanner import vwap_entry_signal
-        vwap_ok, vwap_reason = await asyncio.to_thread(vwap_entry_signal, df)
-        if not vwap_ok:
-            logging.info("[B3] %s VWAP 필터 차단: %s", symbol, vwap_reason)
+        # ── 2차 진입: VWAP 풀백 재진입 (1차 실패 시) ─────────────
+        if not ok:
+            ok, price, stop, reason = await asyncio.to_thread(
+                vwap_pullback_entry,
+                df,
+                candidate.gap_pct,
+                candidate.rvol,
+            )
+            if ok:
+                reason = "[2차]" + reason
+
+        if not ok:
             return
 
         budget = self.bucket_capital.allocated("squeeze")

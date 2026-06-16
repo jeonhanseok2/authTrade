@@ -87,29 +87,86 @@ def _safe(val, default=0.0):
         return default
 
 
+def _check_news_catalyst(symbol: str) -> tuple[bool, str]:
+    """
+    yfinance 뉴스로 카탈리스트 존재 여부 확인.
+    Returns: (has_news, catalyst_type)
+    """
+    try:
+        news = yf.Ticker(symbol).news or []
+        if not news:
+            return False, ""
+        title = (news[0].get("title") or "").lower()
+        if any(k in title for k in ["fda", "approval", "approved", "cleared"]):
+            return True, "fda"
+        if any(k in title for k in ["earnings", "revenue", "profit", "beats", "eps"]):
+            return True, "earnings"
+        if any(k in title for k in ["merger", "acquisition", "buyout", "takeover"]):
+            return True, "ma"
+        if any(k in title for k in ["partnership", "contract", "deal", "agreement"]):
+            return True, "deal"
+        return True, "news"
+    except Exception:
+        return False, ""
+
+
+def get_dynamic_universe(top_n: int = 50) -> List[str]:
+    """
+    yfinance Screener로 당일 갭업/거래량 급증 종목 동적 수집.
+    day_gainers + most_actives 합산 후 중복 제거.
+    실패 시 빈 목록 반환 (기존 watchlist로 폴백).
+    """
+    symbols: List[str] = []
+    for screen in ("day_gainers", "most_actives"):
+        try:
+            s = yf.Screener()
+            s.set_predefined_body(screen)
+            quotes = s.response.get("quotes", [])
+            symbols += [q["symbol"] for q in quotes if q.get("symbol")]
+        except Exception as exc:
+            logging.debug("[scanner] screener(%s) 실패: %s", screen, exc)
+
+    # 중복 제거 + 상위 N개
+    seen: set = set()
+    result: List[str] = []
+    for sym in symbols:
+        if sym not in seen:
+            seen.add(sym)
+            result.append(sym)
+        if len(result) >= top_n:
+            break
+
+    if result:
+        logging.info("[scanner] 동적 유니버스 %d종목 수집", len(result))
+    return result
+
+
 def _fetch_gap_data(symbol: str) -> Optional[GapCandidate]:
     """
     종목 갭업 정보 수집.
-    yfinance fast_info + 일봉 2일치 + ticker.info 활용.
+    60일 일봉으로 진짜 20일 평균 거래량 계산.
     """
     try:
         t = yf.Ticker(symbol)
 
-        # ── 가격 데이터 ───────────────────────────────────────────
-        hist = t.history(period="5d", interval="1d")
+        # ── 가격 데이터 (60일치 — 20일 RVOL 계산용) ─────────────
+        hist = t.history(period="60d", interval="1d")
         if hist is None or len(hist) < 2:
             return None
 
-        prev_close     = float(hist["Close"].iloc[-2])
-        today_open     = float(hist["Open"].iloc[-1])
-        today_high     = float(hist["High"].iloc[-1])
-        today_vol      = float(hist["Volume"].iloc[-1])
-        avg_vol_20     = float(hist["Volume"].rolling(min(len(hist), 5)).mean().iloc[-1])
+        prev_close = float(hist["Close"].iloc[-2])
+        today_open = float(hist["Open"].iloc[-1])
+        today_vol  = float(hist["Volume"].iloc[-1])
 
         if prev_close <= 0:
             return None
 
         gap_pct = (today_open - prev_close) / prev_close * 100
+
+        # 진짜 20일 평균 거래량 (min_periods=5 로 데이터 부족 시 최소 5일)
+        avg_vol_20 = float(
+            hist["Volume"].rolling(20, min_periods=5).mean().iloc[-1]
+        )
 
         # ── ticker.info (느리지만 float/short 정보 포함) ─────────
         info = {}
@@ -120,19 +177,30 @@ def _fetch_gap_data(symbol: str) -> Optional[GapCandidate]:
 
         float_shares  = _safe(info.get("floatShares"))
         short_pct     = _safe(info.get("shortPercentOfFloat", 0.0)) * 100
-        short_ratio   = _safe(info.get("shortRatio"))     # Days to Cover
+        short_ratio   = _safe(info.get("shortRatio"))
         market_cap    = _safe(info.get("marketCap", 0.0)) / 1e6
-        current_price = _safe(info.get("currentPrice") or info.get("regularMarketPrice") or today_open)
+        current_price = _safe(
+            info.get("currentPrice") or info.get("regularMarketPrice") or today_open
+        )
 
-        # ATR (5일 간이 계산)
-        if len(hist) >= 3:
-            tr = (hist["High"] - hist["Low"]).tail(5).mean()
-            atr = float(tr)
+        # ATR 14일 (True Range 기반)
+        if len(hist) >= 14:
+            high  = hist["High"]
+            low   = hist["Low"]
+            close = hist["Close"].shift(1)
+            tr    = pd.concat([
+                high - low,
+                (high - close).abs(),
+                (low  - close).abs(),
+            ], axis=1).max(axis=1)
+            atr = float(tr.rolling(14, min_periods=5).mean().iloc[-1])
         else:
-            atr = 0.0
+            atr = float((hist["High"] - hist["Low"]).mean())
 
-        # 상대 거래량 (RVOL)
         rvol = today_vol / avg_vol_20 if avg_vol_20 > 0 else 0.0
+
+        # ── 뉴스 카탈리스트 확인 ─────────────────────────────────
+        has_news, catalyst = _check_news_catalyst(symbol)
 
         c = GapCandidate(
             symbol          = symbol,
@@ -145,6 +213,8 @@ def _fetch_gap_data(symbol: str) -> Optional[GapCandidate]:
             days_to_cover   = round(short_ratio, 1),
             atr             = round(atr, 2),
             market_cap_m    = round(market_cap, 1),
+            has_news        = has_news,
+            catalyst_type   = catalyst,
         )
         return c
     except Exception as exc:
@@ -251,20 +321,31 @@ def _check_basic_filters(c: GapCandidate, criteria: dict) -> tuple[bool, str]:
 
 
 def scan_gap_candidates(
-    symbols:  List[str],
-    criteria: Optional[dict] = None,
-    min_score: float = 40.0,
+    symbols:         List[str],
+    criteria:        Optional[dict] = None,
+    min_score:       float = 40.0,
+    use_dynamic:     bool  = True,   # yfinance Screener로 동적 유니버스 추가
+    dynamic_top_n:   int   = 50,     # 동적 후보 최대 수
 ) -> List[GapCandidate]:
     """
     종목 리스트에서 갭업 급등 후보 스캔.
+    use_dynamic=True 이면 yfinance day_gainers/most_actives를 symbols에 추가.
 
     Returns:
         점수 내림차순 GapCandidate 리스트
     """
     crit = {**DEFAULT_CRITERIA, **(criteria or {})}
-    results = []
 
-    for sym in symbols:
+    # 정적 watchlist + 동적 유니버스 합산
+    all_symbols = list(symbols)
+    if use_dynamic:
+        dynamic = get_dynamic_universe(top_n=dynamic_top_n)
+        # 중복 없이 추가
+        existing = set(all_symbols)
+        all_symbols += [s for s in dynamic if s not in existing]
+
+    results = []
+    for sym in all_symbols:
         c = _fetch_gap_data(sym)
         if c is None:
             continue
@@ -275,12 +356,22 @@ def scan_gap_candidates(
             continue
 
         c.score = _score_candidate(c, crit)
+
+        # 뉴스 카탈리스트 보너스 (+5점)
+        if c.has_news:
+            bonus = 5.0
+            c.score = min(c.score + bonus, 100.0)
+            c.notes.append(f"뉴스 카탈리스트: {c.catalyst_type}")
+
         if c.score >= min_score:
             results.append(c)
-            logging.info("[scanner] 후보: %s 갭=%+.0f%% RVOL=%.0fx Float=%.1fM 점수=%.0f",
-                         sym, c.gap_pct, c.rvol, c.float_shares / 1e6, c.score)
+            logging.info(
+                "[scanner] 후보: %s 갭=%+.0f%% RVOL=%.0fx Float=%.1fM 점수=%.0f%s",
+                sym, c.gap_pct, c.rvol, c.float_shares / 1e6, c.score,
+                f" [{c.catalyst_type}]" if c.has_news else "",
+            )
 
-        time.sleep(0.1)  # API 속도 제한
+        time.sleep(0.1)
 
     results.sort(key=lambda x: x.score, reverse=True)
     return results
@@ -351,6 +442,72 @@ def vwap_stop_price(df: pd.DataFrame, buffer_pct: float = 0.02) -> float:
     vwap = compute_vwap(df)
     last_vwap = float(vwap.iloc[-1]) if not vwap.empty else 0.0
     return round(last_vwap * (1.0 - buffer_pct), 2) if last_vwap > 0 else 0.0
+
+
+def vwap_pullback_entry(
+    df:               pd.DataFrame,  # 당일 분봉 (최소 10봉 이상)
+    gap_pct:          float,
+    rvol:             float,
+    min_gap_pct:      float = 10.0,  # 1차 진입보다 완화 (10%)
+    vwap_tolerance:   float = 0.005, # VWAP ±0.5% 이내면 VWAP 리테스트 인정
+) -> tuple[bool, float, float, str]:
+    """
+    VWAP 풀백 재진입 (2nd chance entry).
+
+    패턴:
+      1. 갭업 후 첫 번째 모멘텀 랠리 → 고점 형성
+      2. VWAP으로 풀백 (VWAP 근처 ±0.5% 이내 터치)
+      3. 풀백 후 반등 확인 (현재봉 close > 이전봉 close) → 재진입
+
+    1차 진입(첫 5분봉 돌파)보다 낮은 가격에 진입 → R/R 개선.
+    손절 = VWAP 하방 1% (갭앤크랩 신호 = 즉시 청산).
+
+    Returns:
+        (should_enter: bool, entry_price: float, stop_price: float, reason: str)
+    """
+    if len(df) < 5:
+        return False, 0.0, 0.0, "데이터 부족 (최소 5봉 필요)"
+
+    if gap_pct < min_gap_pct:
+        return False, 0.0, 0.0, f"갭업 부족 ({gap_pct:.1f}% < {min_gap_pct}%)"
+
+    vwap        = compute_vwap(df)
+    last        = df.iloc[-1]
+    prev        = df.iloc[-2]
+    current     = float(last.get("close", 0) or 0)
+    prev_close  = float(prev.get("close", 0) or 0)
+    last_vwap   = float(vwap.iloc[-1])
+    prev_vwap   = float(vwap.iloc[-2])
+
+    if last_vwap <= 0 or current <= 0:
+        return False, 0.0, 0.0, "VWAP 계산 불가"
+
+    # 현재가가 VWAP 위여야 함 (갭앤크랩 제외)
+    if current < last_vwap:
+        return False, 0.0, 0.0, "현재가 VWAP 하방 — 갭앤크랩 위험"
+
+    # VWAP 풀백 감지: 이전봉이 VWAP ±tolerance 이내에 있었는지
+    vwap_touch = abs(prev_close - prev_vwap) / prev_vwap <= vwap_tolerance
+    if not vwap_touch:
+        return False, 0.0, 0.0, f"VWAP 미터치 (이전봉 괴리 {abs(prev_close-prev_vwap)/prev_vwap*100:.1f}%)"
+
+    # 반등 확인: 현재봉이 이전봉보다 위
+    if current <= prev_close:
+        return False, 0.0, 0.0, "VWAP 반등 미확인"
+
+    # 거래량 확인 (평균의 1.2x 이상이면 충분)
+    avg_vol = float(df["volume"].mean() or 1)
+    cur_vol = float(last.get("volume", 0) or 0)
+    if cur_vol < avg_vol * 1.2:
+        return False, 0.0, 0.0, f"반등 거래량 부족 ({cur_vol/avg_vol:.1f}x)"
+
+    stop = vwap_stop_price(df, buffer_pct=0.01)
+    reason = (
+        f"VWAP 풀백 재진입 — 갭 {gap_pct:+.0f}%, "
+        f"VWAP 리테스트 후 반등 ({prev_close:.2f}→{current:.2f}), "
+        f"손절 {stop:.2f}"
+    )
+    return True, current, stop, reason
 
 
 # ─────────────────────────────────────────────────────────────────────

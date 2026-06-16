@@ -93,8 +93,13 @@ class Orchestrator:
             return False
         return True
 
+    def _is_toss(self) -> bool:
+        return hasattr(self.broker, "get_candles")  # TossInvestBroker 판별
+
     def _fetch_last(self, symbol: str) -> float:
         try:
+            if self._is_toss():
+                return self.broker.get_price(symbol)
             from alpaca.data.requests import StockLatestTradeRequest  # type: ignore
             resp = self.data_client.get_stock_latest_trade(
                 StockLatestTradeRequest(symbol_or_symbols=symbol)
@@ -122,9 +127,18 @@ class Orchestrator:
 
     def _fetch_bars(self, symbol: str, timeframe: str, limit: int):
         try:
+            import pandas as pd
+
+            if self._is_toss():
+                # Toss API: 1m/5m/1d 캔들 조회
+                toss_interval = {"1Min": "1m", "5Min": "1m", "1Day": "1d"}.get(timeframe, "1d")
+                candles = self.broker.get_candles(symbol, interval=toss_interval, count=limit)
+                if not candles:
+                    return None
+                return pd.DataFrame(candles)[["open", "high", "low", "close", "volume"]]
+
             from alpaca.data.requests  import StockBarsRequest   # type: ignore
             from alpaca.data.timeframe import TimeFrame, TimeFrameUnit  # type: ignore
-            import pandas as pd
 
             tf_map = {
                 "1Min": TimeFrame(1,  TimeFrameUnit.Minute),
@@ -140,7 +154,6 @@ class Orchestrator:
                 return None
             if hasattr(bars, "reset_index"):
                 return bars.reset_index(drop=True)
-            # list of Bar 객체
             rows = [{"open": b.open, "high": b.high, "low": b.low,
                      "close": b.close, "volume": b.volume} for b in bars]
             return pd.DataFrame(rows)

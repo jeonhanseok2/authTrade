@@ -38,6 +38,8 @@ class PollingStream:
         self._last_minute: Dict[str, int] = {}
         # 마지막 bar 데이터 캐시
         self._last_bar: Dict[str, dict] = {}
+        from strategy.spoof_detector import SpoofDetector
+        self._spoof = SpoofDetector()
 
     # ── 심볼 관리 ─────────────────────────────────────────────────────
 
@@ -71,6 +73,9 @@ class PollingStream:
     def stop(self) -> None:
         self._running = False
         logging.info("[Polling] 스트림 정지")
+
+    def is_spoof_blacklisted(self, symbol: str) -> bool:
+        return self._spoof.is_blacklisted(symbol)
 
     # ── 폴링 사이클 ───────────────────────────────────────────────────
 
@@ -110,8 +115,14 @@ class PollingStream:
             if sym in self._hold:
                 try:
                     ob = await asyncio.to_thread(self._broker.get_orderbook, sym)
-                    bid, ask = ob.get("bid", 0.0), ob.get("ask", 0.0)
+                    bid     = ob.get("bid", 0.0)
+                    ask     = ob.get("ask", 0.0)
+                    bid_qty = float(ob.get("bid_qty", 0) or 0)
+                    ask_qty = float(ob.get("ask_qty", 0) or 0)
                     if bid > 0 and ask > 0:
+                        # 스푸핑 감지 (잔량 데이터 있을 때만)
+                        if bid_qty > 0 or ask_qty > 0:
+                            self._spoof.update(sym, bid_qty, ask_qty)
                         await self._on_quote(sym, bid, ask)
                 except Exception as exc:
                     logging.debug("[Polling] on_quote(%s) 오류: %s", sym, exc)

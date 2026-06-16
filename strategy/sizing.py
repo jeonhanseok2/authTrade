@@ -48,3 +48,23 @@ def budget_cap_size(budget_usd: float, price: float) -> int:
     if price <= 0:
         return 0
     return max(0, int(budget_usd // price))
+
+
+def kelly_scale_factor(
+    closed_trades: list,
+    strategy:      str,
+    n:             int   = 5,
+    min_trades:    int   = 3,
+    multiplier:    float = 1.2,
+) -> float:
+    """
+    최근 n회 거래 승률 >= 60% → multiplier 반환, 미달 시 1.0.
+    closed_trades: db.get_closed_trades() 결과 리스트 (dict with pnl_pct, strategy).
+    """
+    strat = [t for t in closed_trades if t.get("strategy") == strategy]
+    recent = strat[-n:]
+    if len(recent) < min_trades:
+        return 1.0
+    wins = sum(1 for t in recent if float(t.get("pnl_pct", 0)) > 0)
+    win_rate = wins / len(recent)
+    return multiplier if win_rate >= 0.60 else 1.0

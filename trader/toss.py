@@ -185,8 +185,10 @@ class TossInvestBroker:
         bids   = result.get("bids", [])
         asks   = result.get("asks", [])
         return {
-            "bid": float(bids[0]["price"]) if bids else 0.0,
-            "ask": float(asks[0]["price"]) if asks else 0.0,
+            "bid":     float(bids[0]["price"]) if bids else 0.0,
+            "ask":     float(asks[0]["price"]) if asks else 0.0,
+            "bid_qty": float(bids[0].get("quantity", 0)) if bids else 0.0,
+            "ask_qty": float(asks[0].get("quantity", 0)) if asks else 0.0,
         }
 
     def get_candles(
@@ -225,6 +227,7 @@ class TossInvestBroker:
         side:      str,           # "buy" | "sell"
         type:      str = "market",  # "market" | "limit"
         price:     Optional[float] = None,
+        tif:       str = "DAY",        # "DAY" or "IOC"
         client_id: Optional[str]  = None,
     ) -> Dict:
         """주문 제출."""
@@ -236,7 +239,7 @@ class TossInvestBroker:
         }
         if type.lower() == "limit" and price:
             payload["price"]       = str(price)
-            payload["timeInForce"] = "DAY"
+            payload["timeInForce"] = tif.upper()  # "DAY" or "IOC"
         if client_id:
             payload["clientOrderId"] = client_id
 

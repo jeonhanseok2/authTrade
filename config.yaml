@@ -2,9 +2,9 @@ risk:
   daily_loss_limit_pct: 0.02
   per_trade_risk_pct: 0.01         # ATR 사이징: 거래당 계좌의 1% 리스크
   atr_multiplier: 2.0              # 손절 거리 = ATR × multiplier
-  stop_loss_pct: 0.05              # 기본 손절 -5%
-  take_profit_pct: 0.10            # 1차 익절 +10%
-  trail_after_profit_pct: 0.10     # +10% 도달 시 트레일링 가동
+  stop_loss_pct: 0.075             # 기본 손절 -7.5%
+  take_profit_pct: 0.15            # 1차 익절 +15%
+  trail_after_profit_pct: 0.15     # +15% 도달 시 트레일링 가동
   trailing_stop_pct: 0.02          # 트레일링 스탑 2%
   eod_exit_minutes_before_close: 15  # 장 마감 15분 전 인트라데이 포지션 청산
   rsi_overbought_exit: 80.0        # RSI >= 80 → 모멘텀 소진 청산
@@ -18,8 +18,8 @@ engine:
   deadzone:
     enabled: true
     start_hour: 11
-    start_min: 30
-    end_hour: 13
+    start_min: 0
+    end_hour: 14
     end_min: 0
 
 regime:
@@ -45,8 +45,8 @@ value_long:
   max_positions: 2                 # 소액이라 최대 2종목으로 제한
   min_fund_score: 55.0             # 펀더멘털 최소 점수 (0~100)
   min_safety_margin_pct: 10.0      # DCF 안전마진 최소 (%)
-  stop_loss_pct: 0.08              # 손절 -8%
-  take_profit_pct: 0.25            # 목표가 +25%
+  stop_loss_pct: 0.12              # 손절 -12%
+  take_profit_pct: 0.38            # 목표가 +38%
   rsi_entry_max: 70.0              # 진입 시 RSI 상한
 
 # ── 버킷 2: ETF 스윙/장기/단기 ──────────────────────────────────────

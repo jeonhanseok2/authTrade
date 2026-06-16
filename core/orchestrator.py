@@ -92,9 +92,17 @@ class Orchestrator:
         """신규 진입 가능 여부 (킬스위치 + 데드존)."""
         if self.kill_switch.is_killed:
             return False
-        from strategy.regime import is_deadzone
-        if is_deadzone(datetime.now(timezone.utc)):
-            return False
+        dz = self.cfg.get("engine", {}).get("deadzone", {})
+        if dz.get("enabled", True):
+            from strategy.regime import is_deadzone
+            if is_deadzone(
+                datetime.now(timezone.utc),
+                start_hour = int(dz.get("start_hour", 11)),
+                start_min  = int(dz.get("start_min",  30)),
+                end_hour   = int(dz.get("end_hour",   13)),
+                end_min    = int(dz.get("end_min",     0)),
+            ):
+                return False
         return True
 
     def _is_toss(self) -> bool:
@@ -186,6 +194,17 @@ class Orchestrator:
     def _calc_qty(self, price: float, budget: float) -> int:
         from strategy.sizing import budget_cap_size
         return budget_cap_size(budget, price)
+
+    def _fetch_ask(self, symbol: str) -> float:
+        """최우선 매도 호가 조회 (IOC 지정가 매수용)."""
+        try:
+            if self._is_toss():
+                ob = self.broker.get_orderbook(symbol)
+                return float(ob.get("ask", 0.0))
+            # Alpaca: 최신 체결가를 ask 근사치로 사용
+            return self._fetch_last(symbol)
+        except Exception:
+            return 0.0
 
     def _do_partial_exit(
         self, sym: str, qty: int, price: float,
@@ -365,7 +384,9 @@ class Orchestrator:
         if strategy == "squeeze":
             # TIERED_ATR_MULT 계단식 트레일링 (300%+ 급등도 고점 근처에서 청산)
             from strategy.squeeze import compute_trailing_stop, is_trailing_stop_hit
-            dyn_stop = compute_trailing_stop(entry, peak, current_stop=0.0, atr=atr)
+            # VIX > 25: ATR 트레일링 배수 1.5x 확장 (변동성 장세에서 스탑 공간 확보)
+            vix_scale = 1.5 if self._prev_vix > 25.0 else 1.0
+            dyn_stop = compute_trailing_stop(entry, peak, current_stop=0.0, atr=atr * vix_scale)
             triggered, _ = is_trailing_stop_hit(last, dyn_stop)
             if triggered:
                 return "trailing_stop"
@@ -491,7 +512,13 @@ class Orchestrator:
             if qty <= 0:
                 continue
             try:
-                self.broker.submit_order(symbol=hedge_sym, qty=qty, side="buy", type="market")
+                ask = self._fetch_ask(hedge_sym)
+                buy_px = round(ask * 1.002, 4) if ask > 0 else None
+                self.broker.submit_order(
+                    symbol=hedge_sym, qty=qty, side="buy",
+                    type="limit" if buy_px else "market",
+                    price=buy_px, tif="IOC",
+                )
                 await asyncio.to_thread(self.db.open_position, hedge_sym, "etf_swing", last, qty, "InverseETF")
                 await asyncio.to_thread(self.db.record_trade, hedge_sym, "buy", qty, last, "etf_swing", "panic_hedge")
                 self._notify(f"🛡️ Panic 헤지: {hedge_sym} {qty}주 @ ${last:.2f}")
@@ -564,7 +591,13 @@ class Orchestrator:
                 continue
 
             try:
-                self.broker.submit_order(symbol=sym, qty=qty, side="buy", type="market")
+                ask = self._fetch_ask(sym)
+                buy_px = round(ask * 1.002, 4) if ask > 0 else None
+                self.broker.submit_order(
+                    symbol=sym, qty=qty, side="buy",
+                    type="limit" if buy_px else "market",
+                    price=buy_px, tif="IOC",
+                )
                 self.db.open_position(sym, "value_long", last, qty, getattr(fs, "sector", ""))
                 self.db.record_trade(sym, "buy", qty, last, "value_long", reason)
                 self._notify(f"[B1] {sym} 매수 {qty}주 @ ${last:.2f} | {reason}")
@@ -630,7 +663,13 @@ class Orchestrator:
                 continue
 
             try:
-                self.broker.submit_order(symbol=sym, qty=qty, side="buy", type="market")
+                ask = self._fetch_ask(sym)
+                buy_px = round(ask * 1.002, 4) if ask > 0 else None
+                self.broker.submit_order(
+                    symbol=sym, qty=qty, side="buy",
+                    type="limit" if buy_px else "market",
+                    price=buy_px, tif="IOC",
+                )
                 self.db.open_position(sym, "etf_swing", last, qty, "ETF")
                 self.db.record_trade(sym, "buy", qty, last, "etf_swing", reason)
                 self._notify(f"[B2] {sym} 매수 {qty}주 @ ${last:.2f} | {reason}")
@@ -693,16 +732,40 @@ class Orchestrator:
         if not ok:
             return
 
+        # 스푸핑 블랙리스트 체크
+        if self._stream and hasattr(self._stream, "is_spoof_blacklisted"):
+            if self._stream.is_spoof_blacklisted(symbol):
+                logging.info("[B3] %s 스푸핑 블랙리스트 — 진입 차단", symbol)
+                return
+
         budget = self.bucket_capital.allocated("squeeze")
         last   = await asyncio.to_thread(self._fetch_last, symbol)
         if last <= 0:
             return
+
+        # 켈리 사이징: 최근 5회 승률 60%+ → 예산 1.2배
+        try:
+            from strategy.sizing import kelly_scale_factor
+            recent_trades = self.db.get_closed_trades(limit=20)
+            kelly = kelly_scale_factor(recent_trades, "squeeze")
+            if kelly > 1.0:
+                logging.info("[B3] 켈리 스케일 %.1fx 적용 (최근 승률 60%+)", kelly)
+            budget = budget * kelly
+        except Exception:
+            pass
+
         qty = self._calc_qty(last, budget / max_pos)
         if qty <= 0:
             return
 
         try:
-            self.broker.submit_order(symbol=symbol, qty=qty, side="buy", type="market")
+            ask = self._fetch_ask(symbol)
+            buy_px = round(ask * 1.002, 4) if ask > 0 else None
+            self.broker.submit_order(
+                symbol=symbol, qty=qty, side="buy",
+                type="limit" if buy_px else "market",
+                price=buy_px, tif="IOC",
+            )
             await asyncio.to_thread(self.db.open_position, symbol, "squeeze", last, qty, "")
             await asyncio.to_thread(self.db.record_trade, symbol, "buy", qty, last, "squeeze", reason)
             if self._stream:

@@ -69,3 +69,11 @@ class KillSwitch:
             self._killed = False
             self._kill_date = None
         logging.info("[KillSwitch] 수동 리셋 완료")
+
+    def force_kill(self) -> None:
+        """세션 단절 등 긴급 상황 — 킬스위치 강제 발동."""
+        from datetime import date as date_cls
+        with self._lock:
+            self._killed = True
+            self._kill_date = date_cls.today()
+        logging.warning("[KillSwitch] 강제 킬 발동 (세션 단절 또는 외부 이벤트)")

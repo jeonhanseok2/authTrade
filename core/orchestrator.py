@@ -37,6 +37,10 @@ PANIC_HEDGE_ETFS = ["SQQQ", "SDS"]
 # VIX 변화율 선제 차단 임계치 (전일 대비 20% 이상 급등)
 VIX_ROC_THRESHOLD = 0.20
 
+# 지정가 청산 슬리피지 (토스 시장가 슬리피지 방지)
+_EXIT_LIMIT_SLIP = 0.003   # 일반 청산: 현재가 -0.3%
+_STOP_LIMIT_SLIP = 0.005   # 손절/긴급: 현재가 -0.5%
+
 
 class Orchestrator:
     def __init__(
@@ -109,11 +113,23 @@ class Orchestrator:
             return 0.0
 
     def _fetch_open_price(self, symbol: str) -> float:
-        """당일 시가 조회."""
-        df = self._fetch_bars(symbol, "1Day", 2)
-        if df is not None and not df.empty and "open" in df.columns:
-            return float(df.iloc[-1]["open"])
-        return 0.0
+        """당일 시가 조회 — Daily 봉 Open 기준 (프리마켓 폭락 반영, 1분봉 아님)."""
+        df = self._fetch_bars(symbol, "1Day", 3)  # 3일치로 장 시작 전 상황도 커버
+        if df is None or df.empty or "open" not in df.columns:
+            return 0.0
+        # 타임스탬프 컬럼이 있으면 오늘자 봉만 선택 (장 시작 전엔 어제 봉이 마지막일 수 있음)
+        from datetime import date
+        import zoneinfo
+        today_et = date.today()  # 서버가 ET 기준이 아닐 수 있어 last row 사용 fallback
+        if "timestamp" in df.columns:
+            df["_date"] = pd.to_datetime(df["timestamp"]).dt.tz_convert(
+                zoneinfo.ZoneInfo("America/New_York")
+            ).dt.date
+            today_rows = df[df["_date"] == today_et]
+            if not today_rows.empty:
+                return float(today_rows.iloc[-1]["open"])
+        # fallback: 마지막 row (Daily 봉이므로 정규장 open = 프리마켓 반영)
+        return float(df.iloc[-1]["open"])
 
     def _fetch_atr(self, symbol: str) -> float:
         df = self._fetch_bars(symbol, "1Day", 20)
@@ -179,7 +195,8 @@ class Orchestrator:
         sell_qty = max(1, int(qty * sell_ratio))
         remain   = qty - sell_qty
         try:
-            self.broker.submit_order(symbol=sym, qty=sell_qty, side="sell", type="market")
+            limit_px = round(price * (1 - _EXIT_LIMIT_SLIP), 4)
+            self.broker.submit_order(symbol=sym, qty=sell_qty, side="sell", type="limit", price=limit_px)
             self.db.update_partial_stage(sym, new_stage, remain)
             self.db.record_trade(sym, "sell", sell_qty, price, strategy,
                                  f"partial_exit_stage{new_stage}")
@@ -198,7 +215,11 @@ class Orchestrator:
             # 청산 전 포지션 정보 조회 (closed_trades 기록용)
             pos = self.db.get_open_position(sym)
 
-            self.broker.submit_order(symbol=sym, qty=qty, side="sell", type="market")
+            # 손절/하드스탑은 넓은 슬리피지, 그 외는 타이트
+            urgent = reason in ("stop_loss", "hard_stop_gap_down", "breakeven_stop")
+            slip   = _STOP_LIMIT_SLIP if urgent else _EXIT_LIMIT_SLIP
+            limit_px = round(price * (1 - slip), 4)
+            self.broker.submit_order(symbol=sym, qty=qty, side="sell", type="limit", price=limit_px)
             self.db.close_position(sym)
             self.db.record_trade(sym, "sell", qty, price, strategy, reason)
 
@@ -712,8 +733,8 @@ class Orchestrator:
         if self._stream:
             self._stream.release(symbol)
 
-    async def run_bucket3_ws(self, scan_symbols: List[str]) -> None:
-        """버킷 3 스트림 시작 (Alpaca WebSocket 또는 Toss PollingStream)."""
+    async def run_bucket3_stream(self, scan_symbols: List[str]) -> None:
+        """버킷 3 스트림 시작 (Toss PollingStream 또는 Alpaca WebSocket)."""
         # main.py에서 미리 PollingStream을 주입한 경우 덮어쓰지 않음
         if self._stream is None:
             self._stream = Bucket3Stream(on_bar=self.on_bar, on_quote=self.on_quote)

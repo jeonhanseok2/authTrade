@@ -7,6 +7,8 @@ shares = risk_amount / stop_distance
 """
 from __future__ import annotations
 
+from typing import Optional
+
 
 def atr_position_size(
     atr: float,
@@ -14,6 +16,7 @@ def atr_position_size(
     risk_per_trade_pct: float,
     price: float,
     atr_multiplier: float = 2.0,
+    budget_cap: Optional[float] = None,
 ) -> int:
     """
     ATR 기반 주문 수량 산출.
@@ -24,6 +27,7 @@ def atr_position_size(
         risk_per_trade_pct: 거래당 리스크 비율 (예: 0.01 = 1%)
         price: 현재 종목 가격
         atr_multiplier: 손절 거리 = ATR × multiplier
+        budget_cap: 이 금액을 초과하는 수량 차단 (버킷 예산 하드캡)
 
     Returns:
         int: 주문 수량 (최소 0)
@@ -33,6 +37,9 @@ def atr_position_size(
     stop_distance = atr * atr_multiplier
     dollar_risk   = account_equity * risk_per_trade_pct
     shares        = int(dollar_risk / stop_distance)
+    # 버킷 예산 하드캡 — ATR이 낮으면 수량이 폭발할 수 있음
+    if budget_cap is not None and budget_cap > 0 and price > 0:
+        shares = min(shares, int(budget_cap / price))
     return max(0, shares)
 
 

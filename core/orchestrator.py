@@ -130,9 +130,15 @@ class Orchestrator:
             import pandas as pd
 
             if self._is_toss():
-                # Toss API: 1m/5m/1d 캔들 조회
-                toss_interval = {"1Min": "1m", "5Min": "1m", "1Day": "1d"}.get(timeframe, "1d")
-                candles = self.broker.get_candles(symbol, interval=toss_interval, count=limit)
+                # Toss API: 1m / 1d 만 지원 (5m 없음)
+                # "5Min" 요청은 1m × 5배 count로 같은 시간 범위 커버
+                if timeframe == "5Min":
+                    toss_interval, toss_count = "1m", limit * 5
+                elif timeframe == "1Min":
+                    toss_interval, toss_count = "1m", limit
+                else:
+                    toss_interval, toss_count = "1d", limit
+                candles = self.broker.get_candles(symbol, interval=toss_interval, count=toss_count)
                 if not candles:
                     return None
                 return pd.DataFrame(candles)[["open", "high", "low", "close", "volume"]]
@@ -668,8 +674,10 @@ class Orchestrator:
             self._stream.release(symbol)
 
     async def run_bucket3_ws(self, scan_symbols: List[str]) -> None:
-        """버킷 3 WebSocket 스트림 시작."""
-        self._stream = Bucket3Stream(on_bar=self.on_bar, on_quote=self.on_quote)
+        """버킷 3 스트림 시작 (Alpaca WebSocket 또는 Toss PollingStream)."""
+        # main.py에서 미리 PollingStream을 주입한 경우 덮어쓰지 않음
+        if self._stream is None:
+            self._stream = Bucket3Stream(on_bar=self.on_bar, on_quote=self.on_quote)
         self._stream.watch(scan_symbols)
 
         # 보유 포지션도 즉시 등록

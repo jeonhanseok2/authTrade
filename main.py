@@ -132,15 +132,21 @@ async def main() -> None:
         bucket_capital=bucket_capital,
     )
 
-    # 토스 브로커일 때 B3 스트림을 PollingStream으로 교체
-    if broker_type == "toss" and mode == "live":
+    # 토스 브로커는 WebSocket 없음 → 항상 PollingStream 사용
+    # (paper 모드도 마찬가지: PaperSimBroker가 주문 실행, PollingStream이 시세 조회)
+    if broker_type == "toss":
         from core.polling_stream import PollingStream
-        orch._stream = PollingStream(
-            broker   = broker,
-            on_bar   = orch.on_bar,
-            on_quote = orch.on_quote,
-        )
-        logging.info("[Toss] B3 WebSocket → 1초 폴링 스트림으로 교체")
+        # paper 모드에서는 Toss 실제 API로 시세는 조회할 수 없으므로 broker=None으로 빈 스트림
+        stream_broker = broker if mode == "live" else None
+        if stream_broker is not None:
+            orch._stream = PollingStream(
+                broker   = stream_broker,
+                on_bar   = orch.on_bar,
+                on_quote = orch.on_quote,
+            )
+            logging.info("[Toss] B3 스트림 → 1초 폴링 (live)")
+        else:
+            logging.info("[Toss] MODE=paper: 폴링 스트림 비활성 (실제 시세 조회 없음)")
 
     # ── 워치리스트 로드 ───────────────────────────────────────────────
     b1_syms = load_watchlist(cfg["value_long"].get("watchlist_file", "watchlists/value_symbols.txt"))

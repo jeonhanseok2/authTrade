@@ -109,6 +109,7 @@ try:
     from data.fetch import fetch_recent_bars
     from data.fundamentals import fetch_quick_fundamentals
     from storage.db import PositionDB
+    from storage import db_manager as dbm
     from strategy.entries import momentum_entry, value_entry
 except ModuleNotFoundError:
     sys.path.append(os.path.dirname(os.path.dirname(__file__)))
@@ -116,6 +117,7 @@ except ModuleNotFoundError:
     from data.fetch import fetch_recent_bars
     from data.fundamentals import fetch_quick_fundamentals
     from storage.db import PositionDB
+    from storage import db_manager as dbm
     from strategy.entries import momentum_entry, value_entry
 
 # ── 브로커 ───────────────────────────────────────────────────────────
@@ -145,6 +147,8 @@ def ask_gpt(prompt: str) -> str:
 
 BOT_COMMANDS = [
     {"command": "ping",       "description": "봇 상태 확인"},
+    {"command": "status",     "description": "현재 모드·그룹·오늘 성적·보유 종목 요약"},
+    {"command": "set_mode",   "description": "모드 강제 전환 (예: /set_mode B3 또는 B2)"},
     {"command": "account",    "description": "계좌 잔고 조회"},
     {"command": "positions",  "description": "보유 포지션 + 진입가 + 고점"},
     {"command": "journal",    "description": "일일 매매 일지 (날짜 미입력 시 오늘)"},
@@ -386,11 +390,79 @@ def main():
 
             # ── 명령 처리 ─────────────────────────────────────────
 
+            if cmd == "/status":
+                try:
+                    # db_manager에서 상태 조회
+                    cur_mode  = dbm.get_system_state("CURRENT_MODE", "알 수 없음")
+                    cur_group = dbm.get_system_state("ACTIVE_GROUP",  "알 수 없음")
+                    b2_alloc  = dbm.get_system_state("B2_ALLOC_MODE", "-")
+
+                    # 오늘 매매 성적
+                    trades_today = dbm.get_trades_today()
+                    closed   = [t for t in trades_today if t["result"] is not None]
+                    wins     = sum(1 for t in closed if t["result"] > 0)
+                    losses   = len(closed) - wins
+                    total_pnl = sum(t["result"] for t in closed) if closed else 0.0
+                    pnl_str  = f"{total_pnl*100:+.2f}%" if closed else "없음"
+
+                    # 보유 종목
+                    holding_str = "없음"
+                    if db:
+                        positions = db.list_open_positions()
+                        if positions:
+                            holding_str = ", ".join(p["symbol"] for p in positions[:10])
+
+                    mode_line = f"<b>{cur_mode}</b>"
+                    if cur_mode == "B2_SWING":
+                        mode_line += f"  (내부: {b2_alloc})"
+
+                    msg = (
+                        "📊 <b>봇 상태 요약</b>\n"
+                        f"현재 모드: {mode_line}\n"
+                        f"활성 그룹: <b>{cur_group}</b>\n"
+                        "\n"
+                        f"📈 오늘 매매 ({len(closed)}건)\n"
+                        f"  수익 {wins}건 / 손실 {losses}건 / 누계 {pnl_str}\n"
+                        "\n"
+                        f"💼 보유 종목: {holding_str}"
+                    )
+                    tg_send(bot_token, chat_id, msg)
+                except Exception as e:
+                    tg_send(bot_token, chat_id, f"상태 조회 오류: {e}")
+                continue
+
+            if cmd == "/set_mode":
+                if not rest:
+                    tg_send(bot_token, chat_id, "형식: /set_mode B3  또는  /set_mode B2")
+                    continue
+                new_mode_str = rest[0].upper()
+                mode_map = {
+                    "B3": "B3_AGGRESSIVE",
+                    "B2": "B2_SWING",
+                    "B3_AGGRESSIVE": "B3_AGGRESSIVE",
+                    "B2_SWING":      "B2_SWING",
+                }
+                if new_mode_str not in mode_map:
+                    tg_send(bot_token, chat_id, "유효한 모드: B3, B2")
+                    continue
+                canonical = mode_map[new_mode_str]
+                try:
+                    dbm.update_system_state("CURRENT_MODE", canonical)
+                    logging.warning("[TG] /set_mode: %s → %s (by %s)", cur_mode if 'cur_mode' in dir() else '?', canonical, user)
+                    tg_send(bot_token, chat_id,
+                            f"✅ 모드 강제 전환: <b>{canonical}</b>\n"
+                            f"⚠️ 다음 프리마켓 스캔(9:20 ET) 전까지 이 모드가 유지됩니다.")
+                except Exception as e:
+                    tg_send(bot_token, chat_id, f"모드 전환 오류: {e}")
+                continue
+
             if cmd in ("/start", "/help"):
                 tg_send(bot_token, chat_id,
                         "📋 <b>명령 목록</b>\n"
                         "\n<b>모니터링</b>\n"
                         "/ping — 봇 상태 확인\n"
+                        "/status — 모드·그룹·오늘 성적·보유 종목\n"
+                        "/set_mode [B3/B2] — 모드 강제 전환\n"
                         "/account — 계좌 잔고\n"
                         "/positions — 포지션 + 진입가 + 고점\n"
                         "\n<b>분석 · 일지</b>\n"

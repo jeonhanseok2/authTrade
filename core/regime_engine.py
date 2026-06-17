@@ -131,13 +131,12 @@ class RegimeEngine:
 
         scan_symbols:  스캔 대상 종목 목록
         conf_scanner:  ConfidenceScanner 인스턴스
-        df_fetcher:    종목 분봉 조회 async callable (없으면 yfinance 직접 조회)
+        df_fetcher:    종목 분봉 조회 async callable (없으면 Alpaca 직접 조회)
 
         Returns:
             결정된 MarketMode
         """
-        import pandas as pd
-        import yfinance as yf
+        from data.alpaca_bars import fetch_bars
 
         qualified = 0
         for sym in scan_symbols[:50]:   # 최대 50종목만 프리마켓 스캔
@@ -145,14 +144,7 @@ class RegimeEngine:
                 if df_fetcher:
                     df = await df_fetcher(sym)
                 else:
-                    raw = await asyncio.to_thread(
-                        yf.download, sym, period="1d", interval="1m",
-                        progress=False, auto_adjust=True,
-                    )
-                    if raw is None or raw.empty:
-                        continue
-                    raw.columns = [c.lower() for c in raw.columns]
-                    df = raw
+                    df = await asyncio.to_thread(fetch_bars, sym, "1Min", 390)
                 if df is None or df.empty:
                     continue
                 score = await asyncio.to_thread(conf_scanner.score, sym, df)

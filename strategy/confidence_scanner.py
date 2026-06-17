@@ -12,7 +12,7 @@
   70~89점: 절반 투입
   < 70점: 진입 금지 (블랙리스트 등록)
 
-장 시작 전 Finviz 필터 → 장 중 yfinance 실시간 점수 갱신.
+장 시작 전 Finviz 필터 → 장 중 Alpaca 실시간 점수 갱신.
 QQQ 기준값은 1분 캐시로 API 호출 최소화.
 """
 from __future__ import annotations
@@ -24,7 +24,6 @@ from datetime import date as _date
 from typing import Dict, List, Optional, Set
 
 import pandas as pd
-import yfinance as yf
 
 # ── 점수 임계치 ───────────────────────────────────────────────────────
 SCORE_FULL_CAPITAL  = 90   # 전액 투입
@@ -118,10 +117,11 @@ class _QQQCache:
 
     def _refresh(self, today: _date) -> None:
         try:
-            df = yf.download("QQQ", period="1d", interval="1m", progress=False, auto_adjust=True)
+            from data.alpaca_bars import fetch_bars
+            df = fetch_bars("QQQ", "1Min", 390)
             if df is not None and len(df) >= 2:
-                open_px  = float(df["Close"].iloc[0])
-                last_px  = float(df["Close"].iloc[-1])
+                open_px  = float(df["close"].iloc[0])
+                last_px  = float(df["close"].iloc[-1])
                 if open_px > 0:
                     self._return = (last_px - open_px) / open_px * 100
             self._ts   = time.monotonic()

@@ -60,25 +60,25 @@ DEFAULT_SYMBOLS = {
 # ─────────────────────────────────────────────────────────────────────
 
 def fetch_data(symbols: list[str], days: int, interval: str) -> dict[str, pd.DataFrame]:
-    """yfinance로 OHLCV 데이터 페치."""
-    import yfinance as yf
+    """Alpaca Historical Data API로 OHLCV 데이터 페치."""
+    from data.alpaca_bars import fetch_bars
 
-    period = f"{days}d"
+    _tf_map = {
+        "1d": ("1Day",  days),
+        "1m": ("1Min",  days * 390),
+        "5m": ("5Min",  days * 78),
+    }
+    tf, limit = _tf_map.get(interval, ("1Day", days))
+
     dfs = {}
-    logging.info("데이터 다운로드: %d종목 / %s / %s", len(symbols), interval, period)
+    logging.info("데이터 다운로드: %d종목 / %s / %dd", len(symbols), interval, days)
 
     for sym in symbols:
         try:
-            df = yf.download(sym, period=period, interval=interval,
-                             progress=False, auto_adjust=True)
-            if df.empty:
+            df = fetch_bars(sym, tf, limit)
+            if df is None or df.empty:
                 logging.warning("%s: 데이터 없음", sym)
                 continue
-            # yfinance 0.2.x는 MultiIndex 반환 — 티커 레벨 제거
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = [col[0].lower() for col in df.columns]
-            else:
-                df.columns = [c.lower() for c in df.columns]
             df = df[["open", "high", "low", "close", "volume"]].dropna()
             if len(df) < 20:
                 logging.warning("%s: 데이터 부족 (%d봉)", sym, len(df))

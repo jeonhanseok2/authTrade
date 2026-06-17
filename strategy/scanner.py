@@ -147,16 +147,16 @@ def _fetch_gap_data(symbol: str) -> Optional[GapCandidate]:
     60일 일봉으로 진짜 20일 평균 거래량 계산.
     """
     try:
-        t = yf.Ticker(symbol)
+        from data.alpaca_bars import fetch_bars
 
         # ── 가격 데이터 (60일치 — 20일 RVOL 계산용) ─────────────
-        hist = t.history(period="60d", interval="1d")
+        hist = fetch_bars(symbol, "1Day", 60)
         if hist is None or len(hist) < 2:
             return None
 
-        prev_close = float(hist["Close"].iloc[-2])
-        today_open = float(hist["Open"].iloc[-1])
-        today_vol  = float(hist["Volume"].iloc[-1])
+        prev_close = float(hist["close"].iloc[-2])
+        today_open = float(hist["open"].iloc[-1])
+        today_vol  = float(hist["volume"].iloc[-1])
 
         if prev_close <= 0:
             return None
@@ -165,13 +165,13 @@ def _fetch_gap_data(symbol: str) -> Optional[GapCandidate]:
 
         # 진짜 20일 평균 거래량 (min_periods=5 로 데이터 부족 시 최소 5일)
         avg_vol_20 = float(
-            hist["Volume"].rolling(20, min_periods=5).mean().iloc[-1]
+            hist["volume"].rolling(20, min_periods=5).mean().iloc[-1]
         )
 
-        # ── ticker.info (느리지만 float/short 정보 포함) ─────────
+        # ── ticker.info (fundamentals — yfinance 유지) ───────────
         info = {}
         try:
-            info = t.info or {}
+            info = yf.Ticker(symbol).info or {}
         except Exception:
             pass
 
@@ -185,9 +185,9 @@ def _fetch_gap_data(symbol: str) -> Optional[GapCandidate]:
 
         # ATR 14일 (True Range 기반)
         if len(hist) >= 14:
-            high  = hist["High"]
-            low   = hist["Low"]
-            close = hist["Close"].shift(1)
+            high  = hist["high"]
+            low   = hist["low"]
+            close = hist["close"].shift(1)
             tr    = pd.concat([
                 high - low,
                 (high - close).abs(),
@@ -195,7 +195,7 @@ def _fetch_gap_data(symbol: str) -> Optional[GapCandidate]:
             ], axis=1).max(axis=1)
             atr = float(tr.rolling(14, min_periods=5).mean().iloc[-1])
         else:
-            atr = float((hist["High"] - hist["Low"]).mean())
+            atr = float((hist["high"] - hist["low"]).mean())
 
         rvol = today_vol / avg_vol_20 if avg_vol_20 > 0 else 0.0
 

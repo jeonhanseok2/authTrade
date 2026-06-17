@@ -28,7 +28,6 @@ from enum import Enum
 from typing import Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
-import yfinance as yf
 
 
 # ── 유니버스 ─────────────────────────────────────────────────────────
@@ -41,7 +40,6 @@ MA20_PERIOD          = 20    # 일봉 MA 기간
 WEEKLY_MA_PERIOD     = 20    # 주봉 이동평균 기간 (= 약 20주 = 100 거래일)
 ATR_TRAIL_MULT       = 1.5   # ATR 트레일링 배수
 LEVERAGE_SPLIT       = 0.50  # 레버리지 2종목 각 50% 배분
-DATA_CACHE_SEC       = 60    # yfinance 캐시 TTL (초)
 REBALANCE_HOUR_ET    = 9     # 리밸런싱 시각 (ET, 장 시작 전)
 REBALANCE_MINUTE_ET  = 15
 
@@ -79,29 +77,14 @@ class AllocationTarget:
 # ── 데이터 유틸 ──────────────────────────────────────────────────────
 
 def _fetch_daily(symbol: str, period: str = "60d") -> Optional[pd.DataFrame]:
-    try:
-        df = yf.download(symbol, period=period, interval="1d",
-                         progress=False, auto_adjust=True)
-        if df is None or df.empty:
-            return None
-        df.columns = [c.lower() for c in df.columns]
-        return df
-    except Exception as exc:
-        logging.debug("[B2Alloc] %s 일봉 조회 실패: %s", symbol, exc)
-        return None
+    from data.alpaca_bars import fetch_bars
+    limit = int(period.rstrip("d")) if period.endswith("d") else 60
+    return fetch_bars(symbol, "1Day", limit)
 
 
 def _fetch_weekly(symbol: str) -> Optional[pd.DataFrame]:
-    try:
-        df = yf.download(symbol, period="2y", interval="1wk",
-                         progress=False, auto_adjust=True)
-        if df is None or df.empty:
-            return None
-        df.columns = [c.lower() for c in df.columns]
-        return df
-    except Exception as exc:
-        logging.debug("[B2Alloc] %s 주봉 조회 실패: %s", symbol, exc)
-        return None
+    from data.alpaca_bars import fetch_bars
+    return fetch_bars(symbol, "1Week", 104)  # 2년 × 52주
 
 
 def _ma20(df: pd.DataFrame) -> float:

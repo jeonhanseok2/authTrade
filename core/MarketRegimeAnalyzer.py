@@ -105,9 +105,9 @@ class MarketRegimeAnalyzer:
         신뢰도 스캔 → 모드 결정.
 
         df_fetcher: async callable(symbol) -> pd.DataFrame | None
-                    미제공 시 yfinance 직접 조회.
+                    미제공 시 Alpaca 직접 조회.
         """
-        import yfinance as yf
+        from data.alpaca_bars import fetch_bars
 
         scores: Dict[str, ConfidenceScore] = {}
         qualified = 0
@@ -117,14 +117,7 @@ class MarketRegimeAnalyzer:
                 if df_fetcher:
                     df = await df_fetcher(sym)
                 else:
-                    raw = await asyncio.to_thread(
-                        yf.download, sym, period="1d", interval="1m",
-                        progress=False, auto_adjust=True,
-                    )
-                    if raw is None or raw.empty:
-                        continue
-                    raw.columns = [c.lower() for c in raw.columns]
-                    df = raw
+                    df = await asyncio.to_thread(fetch_bars, sym, "1Min", 390)
 
                 if df is None or df.empty:
                     continue

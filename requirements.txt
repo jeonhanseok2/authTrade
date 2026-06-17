@@ -9,3 +9,7 @@ pydantic-settings>=2.4.0
 google-generativeai>=0.7.0
 pytest>=8.0
 pytest-mock>=3.12
+# 스크래핑 (Finviz 파싱용)
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0

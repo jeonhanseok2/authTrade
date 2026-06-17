@@ -101,6 +101,67 @@ def _tiered(value: float, tiers: list) -> int:
     return 0
 
 
+def _accumulation_bonus(df: pd.DataFrame) -> tuple[int, str]:
+    """
+    세력 매집 패턴 보너스 점수 (최대 +15점).
+
+    세력이 조용히 사모으는 중: 거래량 폭발 but 가격은 아직 횡보.
+    이 신호가 있으면 곧 급등 가능성 높음 → 진입 신뢰도 상향.
+
+    3개 조건 각 5점:
+      1. 거래량 선행 (RVOL ≥3x but 가격 변화 <3%) — 세력 매집 중
+      2. 연속 양봉 (최근 5봉 중 4봉+ 상승봉) — 지속 매수세
+      3. 풀백 거래량 감소 (하락봉 거래량 < 상승봉 × 0.6) — 약한 매도
+    """
+    if df is None or len(df) < 5:
+        return 0, ""
+
+    try:
+        recent   = df.tail(10)
+        first_c  = float(recent.iloc[0].get("close", 0) or 0)
+        last_c   = float(recent.iloc[-1].get("close", 0) or 0)
+        avg_vol  = float(recent["volume"].mean() or 1)
+        last_vol = float(recent.iloc[-1].get("volume", 0) or 0)
+
+        score = 0
+        notes = []
+
+        # 조건 1: 거래량 선행 — RVOL 높지만 가격 변화 작음
+        price_chg_pct = abs(last_c - first_c) / max(first_c, 0.01) * 100
+        rvol = last_vol / max(avg_vol, 1)
+        if rvol >= 3.0 and price_chg_pct < 3.0:
+            score += 5
+            notes.append(f"매집신호(RVOL {rvol:.1f}x/가격변화{price_chg_pct:.1f}%)")
+
+        # 조건 2: 연속 양봉 (지속 매수세)
+        up_bars = sum(
+            1 for _, r in recent.tail(5).iterrows()
+            if float(r.get("close", 0) or 0) > float(r.get("open", 0) or 0)
+        )
+        if up_bars >= 4:
+            score += 5
+            notes.append(f"연속양봉{up_bars}/5")
+
+        # 조건 3: 풀백 거래량 감소 (약한 매도 = 강한 손들이 홀딩)
+        up_vols   = [float(r.get("volume", 0) or 0) for _, r in recent.iterrows()
+                     if float(r.get("close", 0) or 0) > float(r.get("open", 0) or 0)]
+        down_vols = [float(r.get("volume", 0) or 0) for _, r in recent.iterrows()
+                     if float(r.get("close", 0) or 0) <= float(r.get("open", 0) or 0)]
+        if up_vols and down_vols:
+            avg_up   = sum(up_vols)   / len(up_vols)
+            avg_down = sum(down_vols) / len(down_vols)
+            if avg_down < avg_up * 0.6:
+                score += 5
+                notes.append(f"풀백거래량감소({avg_down/avg_up:.1f}x)")
+
+        if score > 0:
+            return score, f"매집패턴+{score}pt " + " ".join(notes)
+    except Exception:
+        pass
+
+    return 0, ""
+
+
 class _QQQCache:
     """QQQ 당일 수익률 캐시 (1분 TTL)."""
 
@@ -234,7 +295,11 @@ class ConfidenceScanner:
                 result.vwap_score = 0
                 result.notes.append(f"VWAP 하방 {above_pct*100:.1f}%")
 
-        result.total = result.rvol_score + result.alpha_score + result.vwap_score
+        # ── 세력 매집 패턴 보너스 (최대 +15점) ──────────────────────────
+        accum_bonus, accum_note = _accumulation_bonus(df)
+        result.total = result.rvol_score + result.alpha_score + result.vwap_score + accum_bonus
+        if accum_note:
+            result.notes.append(accum_note)
 
         # ── 블랙리스트 자동 등록 ─────────────────────────────────────
         if result.total < SCORE_BLACKLIST:

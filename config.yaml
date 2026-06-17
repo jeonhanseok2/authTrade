@@ -1,3 +1,19 @@
+# ── Alpaca 플랜 티어 ──────────────────────────────────────────────────
+# .env 의 ALPACA_PLAN 환경변수로 제어 (이 파일은 문서용)
+#
+# free (기본, 페이퍼 테스트):
+#   - 스캔: 9:40 AM ET (장 개시 10분 후)
+#   - 데이터: Alpaca 장중 bars + 뉴스 + SEC EDGAR + Finviz 스크래핑
+#   - API 동시 요청: 세마포어 10
+#
+# unlimited ($9/월, 실전 전환 시):
+#   - 스캔: 8:00 AM ET (프리마켓)
+#   - 데이터: 위 + 프리마켓 1분봉 (4:00~9:30 ET)
+#   - API 동시 요청: 세마포어 50
+#   - .env: ALPACA_PLAN=unlimited
+#
+alpaca_plan: free   # 문서용 — 실제 동작은 ALPACA_PLAN 환경변수로 결정
+
 risk:
   daily_loss_limit_pct: 0.02
   per_trade_risk_pct: 0.01         # ATR 사이징: 거래당 계좌의 1% 리스크

@@ -33,6 +33,8 @@ class Bucket3Stream:
         self._stream      = None
         self._watch: Set[str] = set()   # 진입 감시 종목 (후보)
         self._hold:  Set[str] = set()   # 보유 포지션 (Spread 감시)
+        self._bar_handler   = None      # run() 에서 세팅 — 동적 구독용 재사용
+        self._quote_handler = None
 
     # ── 종목 등록/해제 ────────────────────────────────────────────────
 
@@ -49,6 +51,28 @@ class Bucket3Stream:
         """포지션 청산 후 감시 해제."""
         self._hold.discard(symbol)
         self._watch.discard(symbol)
+
+    def add_symbols(self, symbols: list[str]) -> None:
+        """
+        실행 중인 스트림에 신규 종목 동적 추가.
+
+        watch set을 업데이트하고, 스트림이 실행 중이면 WebSocket 구독도 갱신.
+        스트림 미시작 시 watch만 업데이트 → run() 시작 시 자동으로 포함.
+        """
+        new = [s.upper() for s in symbols if s.upper() not in self._watch]
+        if not new:
+            return
+        self._watch.update(new)
+        if self._stream is not None and self._bar_handler is not None:
+            try:
+                # 기존 핸들러(_bar_handler)를 재사용 — self._watch 참조하므로 새 종목 자동 처리
+                self._stream.subscribe_bars(self._bar_handler, *new)
+                self._stream.subscribe_quotes(self._quote_handler, *new)
+                logging.info("[WS] 동적 구독 추가 %d종목: %s", len(new), new[:8])
+            except Exception as exc:
+                logging.warning("[WS] 동적 구독 실패 (다음 재시작 시 적용): %s", exc)
+        else:
+            logging.info("[WS] watch 추가 %d종목 (스트림 시작 전, 시작 시 구독됨): %s", len(new), new[:8])
 
     # ── 스트림 시작/종료 ──────────────────────────────────────────────
 
@@ -93,6 +117,10 @@ class Bucket3Stream:
                     await self._on_quote(sym, bid, ask)
                 except Exception as exc:
                     logging.error("[WS] quote_handler 예외 (%s): %s", sym, exc)
+
+        # add_symbols()에서 재사용할 수 있도록 인스턴스에 저장
+        self._bar_handler   = _bar_handler
+        self._quote_handler = _quote_handler
 
         self._stream.subscribe_bars(_bar_handler, *all_syms)
         self._stream.subscribe_quotes(_quote_handler, *all_syms)

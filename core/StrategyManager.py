@@ -118,12 +118,14 @@ class StrategyManager:
         self,
         scan_symbols: List[str],
         df_fetcher=None,
+        stream_update_fn=None,   # callable(List[str]) — WebSocket 동적 추가용
     ) -> None:
         """
-        main.py asyncio.gather 태스크 — 매일 9:20 ET 모드 결정.
+        main.py asyncio.gather 태스크 — 매일 9:40 ET 모드 결정.
 
         스캔 완료 후 모드가 전환되었으면 AccountManager.on_mode_switch()를
         호출하여 Settled Cash를 재확인합니다.
+        stream_update_fn: Bucket3Stream.add_symbols 래퍼 (뉴스 신규 종목 WebSocket 추가).
         """
         import asyncio as _asyncio
 
@@ -133,18 +135,24 @@ class StrategyManager:
             ET = zoneinfo.ZoneInfo("America/New_York")
             last_date = _date.min
 
-            logging.info("[StrategyManager] 프리마켓 루프 시작 (매일 9:20 ET)")
+            from core.MarketRegimeAnalyzer import PREMARKET_SCAN_HOUR, PREMARKET_SCAN_MINUTE
+            logging.info(
+                "[StrategyManager] 프리마켓 루프 시작 (매일 %02d:%02d ET)",
+                PREMARKET_SCAN_HOUR, PREMARKET_SCAN_MINUTE,
+            )
             while True:
                 try:
                     now_et = datetime.now(ET)
                     if (
                         now_et.weekday() < 5
-                        and now_et.hour   == 9
-                        and now_et.minute == 40   # 장 개시 10분 후 — 실제 1분봉 기반 alpha 계산
+                        and now_et.hour   == PREMARKET_SCAN_HOUR
+                        and now_et.minute == PREMARKET_SCAN_MINUTE
                         and last_date != _date.today()
                     ):
                         prev_mode = self.current_mode
-                        result: ScanResult = await self._analyzer.scan(scan_symbols, df_fetcher)
+                        result: ScanResult = await self._analyzer.scan(
+                            scan_symbols, df_fetcher, stream_update_fn
+                        )
                         last_date = _date.today()
 
                         # 모드 전환 시 자금 재확인 (T+1 Settled Cash 동기화)

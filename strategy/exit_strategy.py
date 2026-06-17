@@ -180,7 +180,71 @@ def analyze_sell_pressure(df: pd.DataFrame) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 4. 본절가 트랩 (Breakeven Trap)
+# 4. Blow-off Top 감지 (세력 Dump 직전 신호)
+#
+# 패턴: 연속 급등 → 마지막 봉에서 거래량 폭발 + 위꼬리 or 하락봉
+# 세력이 물량 분배(distribution) 시작한 신호.
+# 잔량 50% 즉시 청산 → ATR 트레일링으로 나머지 추적.
+# ─────────────────────────────────────────────────────────────────────
+def detect_blowoff_top(df: pd.DataFrame) -> tuple[bool, str]:
+    """
+    Blow-off top 감지 — 세력 dump 직전 분배 시작 신호.
+
+    3가지 조건 중 2개 이상 충족 시 True:
+      1. 연속 3봉+ 상승 (close > open or close > prev close)
+      2. 마지막 봉 거래량 > 이전 3봉 평균 × 2.5 (물량 쏟아내는 중)
+      3. 마지막 봉 close < (high+low)/2 (위꼬리 — 매도세 출현)
+
+    Returns:
+        (is_blowoff: bool, reason: str)
+    """
+    if df is None or len(df) < 5:
+        return False, ""
+
+    try:
+        recent = df.tail(5)
+        last   = recent.iloc[-1]
+        prev3  = recent.iloc[-4:-1]
+
+        hi   = float(last.get("high",  0) or 0)
+        lo   = float(last.get("low",   0) or 0)
+        op   = float(last.get("open",  0) or 0)
+        cl   = float(last.get("close", 0) or 0)
+        vol  = float(last.get("volume",0) or 0)
+
+        if hi <= lo or cl <= 0:
+            return False, ""
+
+        # 조건 1: 연속 상승 (최근 3봉 중 2봉 이상이 상승봉)
+        rising = sum(
+            1 for _, r in prev3.iterrows()
+            if float(r.get("close", 0) or 0) > float(r.get("open", 0) or 0)
+        )
+        cond1 = rising >= 2
+
+        # 조건 2: 거래량 폭발
+        avg_vol3 = float(prev3["volume"].mean() or 1)
+        cond2 = avg_vol3 > 0 and vol > avg_vol3 * 2.5
+
+        # 조건 3: 위꼬리 (close가 bar 중간값 이하) 또는 하락봉
+        midpoint = (hi + lo) / 2
+        cond3 = cl < midpoint or cl < op
+
+        conditions_met = sum([cond1, cond2, cond3])
+        if conditions_met >= 2:
+            reason = (
+                f"Blow-off top — 연속상승:{cond1} 거래량폭발:{cond2}({vol/avg_vol3:.1f}x) "
+                f"위꼬리/하락:{cond3} → 물량 분배 시작"
+            )
+            return True, reason
+    except Exception:
+        pass
+
+    return False, ""
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 5. 본절가 트랩 (Breakeven Trap)
 # ─────────────────────────────────────────────────────────────────────
 def check_breakeven_trap(
     entry_price:     float,
@@ -285,6 +349,24 @@ class ExitStrategyEngine:
             self.shakeout.clear(symbol)
             logging.warning("[ExitEngine][%s] 오더플로우: %s", symbol, reason)
             return ExitSignal(ExitDecision.SELL, f"orderflow_pressure:{reason}")
+
+        # ── Layer 2.5: Blow-off Top (수익 +20% 이상에서만 체크) ──────
+        # 세력 dump 직전 분배 신호 — 오더플로우보다 먼저 나타남
+        if profit_pct >= 0.20:
+            is_blowoff, blow_reason = detect_blowoff_top(df)
+            if is_blowoff:
+                self._notify(
+                    f"🔔 [{symbol}] Blow-off top 감지 — 분배 시작 가능성\n"
+                    f"상세: {blow_reason}\n"
+                    f"→ ATR 트레일링 타이트하게 조정"
+                )
+                logging.warning("[ExitEngine][%s] Blow-off top: %s", symbol, blow_reason)
+                # Blow-off top은 즉시 청산이 아닌 trailing stop 강화 신호로 처리
+                # (개미 털기와 구분하기 위해 SHAKEOUT_WAIT 활용하지 않고 직접 SELL)
+                if profit_pct >= 0.50:
+                    # 고수익 구간 blow-off는 즉시 청산 (욕심 부리면 다 날림)
+                    self.shakeout.clear(symbol)
+                    return ExitSignal(ExitDecision.SELL, f"blowoff_top:{blow_reason}")
 
         # ── Layer 3: 가변 ATR 트레일링 스탑 + 개미 털기 방어 ─────────
         trailing_stop = update_trailing_stop(

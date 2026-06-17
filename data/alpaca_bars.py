@@ -22,8 +22,9 @@ import pandas as pd
 
 _CLIENT      = None
 _CLIENT_LOCK = threading.Lock()
-# B1·B2·B3·뉴스 동시 호출 시 in-flight HTTP 요청 상한 (Alpaca free: 200 req/min)
-_SEMAPHORE   = threading.Semaphore(10)
+# 세마포어 크기 = tier.py 에서 결정 (free: 10, unlimited: 50)
+from data.tier import SEMAPHORE_SIZE as _SEM_SIZE
+_SEMAPHORE   = threading.Semaphore(_SEM_SIZE)
 
 
 def _get_client():
@@ -42,17 +43,19 @@ def _get_client():
 
 
 def fetch_bars(
-    symbol:    str,
-    timeframe: str = "1Day",   # "1Min" | "5Min" | "1Day" | "1Week"
-    limit:     int = 60,
+    symbol:         str,
+    timeframe:      str  = "1Day",   # "1Min" | "5Min" | "1Day" | "1Week"
+    limit:          int  = 60,
+    extended_hours: bool = False,    # True → 프리마켓/시간외 포함 (unlimited 플랜 필요)
 ) -> Optional[pd.DataFrame]:
     """
     Alpaca Historical Data API로 OHLCV 봉 조회.
 
     Args:
-        symbol:    종목 코드 (예: "NVDA", "QQQ")
-        timeframe: "1Min" | "5Min" | "1Day" | "1Week"
-        limit:     조회할 최대 봉 수
+        symbol:         종목 코드 (예: "NVDA", "QQQ")
+        timeframe:      "1Min" | "5Min" | "1Day" | "1Week"
+        limit:          조회할 최대 봉 수
+        extended_hours: 프리마켓/시간외 봉 포함 여부 (ALPACA_PLAN=unlimited 필요)
 
     Returns:
         columns=[open, high, low, close, volume] DataFrame,
@@ -69,7 +72,12 @@ def fetch_bars(
             "1Week": TimeFrame(1, TimeFrameUnit.Week),
         }
         tf  = tf_map.get(timeframe, TimeFrame(1, TimeFrameUnit.Day))
-        req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=tf, limit=limit)
+        req = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=tf,
+            limit=limit,
+            extended_hours=extended_hours if extended_hours else None,
+        )
 
         with _SEMAPHORE:
             resp = _get_client().get_stock_bars(req)

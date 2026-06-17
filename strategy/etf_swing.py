@@ -305,6 +305,10 @@ def swing_b2_entry(
     if prev_rsi >= 35:
         return False, f"RSI 과매도 미충족 (직전 RSI {prev_rsi:.1f} >= 35)", 0.0
 
+    # 조건 2b: 현재봉 RSI 과매수 차단 (직전봉 과매도였어도 현재봉이 75+ 면 이미 급등 완료)
+    if rsi >= 75:
+        return False, f"RSI 과매수 진입 차단 (현재 RSI {rsi:.1f} >= 75)", 0.0
+
     # 조건 3: 현재봉 반등 확인
     if close <= prev_close:
         return False, "반등 미확인 (현재봉 close ≤ 직전봉)", 0.0

@@ -22,13 +22,17 @@ import zoneinfo
 from core.regime_engine          import RegimeEngine, MarketMode
 from strategy.confidence_scanner import ConfidenceScanner, ConfidenceScore
 from strategy.news_analyzer      import NewsAnalyzer
+from data.tier import (
+    SCAN_HOUR         as PREMARKET_SCAN_HOUR,
+    SCAN_MINUTE       as PREMARKET_SCAN_MINUTE,
+    BAR_LIMIT_INTRADAY as PREMARKET_BAR_LIMIT,
+    EXTENDED_HOURS_FEED as PREMARKET_EXTENDED,
+    describe          as _tier_describe,
+)
 
-ET                    = zoneinfo.ZoneInfo("America/New_York")
-# 9:40 ET: 장 개시 10분 후 → 실제 1분봉 10개 확보, QQQ alpha 계산 가능
-PREMARKET_SCAN_HOUR   = 9
-PREMARKET_SCAN_MINUTE = 40
-SCAN_MAX_SYMBOLS      = 50
-SCAN_INTERVAL_SEC     = 30
+ET                = zoneinfo.ZoneInfo("America/New_York")
+SCAN_MAX_SYMBOLS  = 50
+SCAN_INTERVAL_SEC = 30
 
 
 @dataclass
@@ -101,20 +105,47 @@ class MarketRegimeAnalyzer:
         self,
         scan_symbols: List[str],
         df_fetcher=None,
+        stream_update_fn=None,   # callable(List[str]) — 신규 종목을 WS 스트림에 추가
     ) -> ScanResult:
         """
         신뢰도 스캔 → 모드 결정 (병렬 처리).
 
-        df_fetcher: async callable(symbol) -> pd.DataFrame | None
-                    미제공 시 Alpaca 직접 조회 (세마포어 10 적용).
+        df_fetcher:      async callable(symbol) -> pd.DataFrame | None
+                         미제공 시 Alpaca 직접 조회 (세마포어 10 적용).
+        stream_update_fn: callable(syms) — 뉴스 발굴 신규 종목을 WebSocket에 동적 추가.
         호출 시각: 9:40 ET — 장 개시 10분 후 실제 1분봉 기반 alpha 계산 가능.
         """
         from data.alpaca_bars import fetch_bars
 
+        # ── 뉴스 기반 신규 종목 발굴 및 스캔 리스트 확장 ──────────────
+        try:
+            from data.news_universe import fetch_catalyst_symbols
+            news_syms = await asyncio.to_thread(fetch_catalyst_symbols, 4, 100)
+            if news_syms:
+                existing = set(scan_symbols)
+                added    = [s for s in news_syms if s not in existing]
+                if added:
+                    scan_symbols = list(scan_symbols) + added
+                    logging.info(
+                        "[MarketRegimeAnalyzer] 뉴스 기반 종목 %d개 추가 → 총 스캔 %d개: %s",
+                        len(added), len(scan_symbols), added[:8],
+                    )
+                    # WebSocket에 신규 종목 동적 추가
+                    if stream_update_fn and added:
+                        try:
+                            stream_update_fn(added)
+                        except Exception as exc:
+                            logging.debug("[MarketRegimeAnalyzer] stream 업데이트 실패: %s", exc)
+        except Exception as exc:
+            logging.debug("[MarketRegimeAnalyzer] 뉴스 유니버스 실패 (무시): %s", exc)
+
         async def _scan_one(sym: str):
             try:
                 df = await df_fetcher(sym) if df_fetcher else \
-                     await asyncio.to_thread(fetch_bars, sym, "1Min", 390)
+                     await asyncio.to_thread(
+                         fetch_bars, sym, "1Min",
+                         PREMARKET_BAR_LIMIT, PREMARKET_EXTENDED,
+                     )
                 if df is None or df.empty:
                     return None
                 sc = await asyncio.to_thread(self._scanner.score, sym, df)
@@ -166,12 +197,13 @@ class MarketRegimeAnalyzer:
         self,
         scan_symbols: List[str],
         df_fetcher=None,
+        stream_update_fn=None,   # callable(List[str]) — WebSocket 동적 추가용
     ) -> None:
         """
-        매일 9:20 ET 프리마켓 스캔 루프.
+        매일 9:40 ET 프리마켓 스캔 루프.
         main.py asyncio.gather에 태스크로 등록.
         """
-        logging.info("[MarketRegimeAnalyzer] 프리마켓 루프 시작 (매일 9:20 ET 스캔)")
+        logging.info("[MarketRegimeAnalyzer] 프리마켓 루프 시작 — %s", _tier_describe())
         while True:
             try:
                 now_et = datetime.now(ET)
@@ -181,7 +213,7 @@ class MarketRegimeAnalyzer:
                     and now_et.minute == PREMARKET_SCAN_MINUTE
                     and self._last_date != _date.today()
                 ):
-                    await self.scan(scan_symbols, df_fetcher)
+                    await self.scan(scan_symbols, df_fetcher, stream_update_fn)
             except Exception as exc:
                 logging.error("[MarketRegimeAnalyzer] 루프 오류: %s", exc)
             await asyncio.sleep(SCAN_INTERVAL_SEC)

@@ -115,6 +115,9 @@ class Orchestrator:
         self._3min_checked: set = set()
         # 당일 시가 캐시: symbol → (date, open_px) — 장 중 불변값 재조회 방지
         self._open_price_cache: Dict[str, tuple] = {}
+        # B3 일간 갭/RVOL 캐시: symbol → (gap_pct, rvol, date_str)
+        # on_bar()는 gap_pct=0/rvol=0 기본값이라 항상 진입 실패 → 여기서 실제 값 계산
+        self._b3_daily_cache: Dict[str, tuple] = {}
 
     # ──────────────────────────────────────────────────────────────────
     # 공통 유틸
@@ -126,6 +129,42 @@ class Orchestrator:
                 self.notifier.send(msg)
             except Exception:
                 pass
+
+    def _get_b3_gap_data(self, symbol: str, df_intraday: pd.DataFrame) -> tuple:
+        """
+        B3 on_bar()용 갭업%·RVOL 계산 (종목당 하루 1회 캐시).
+
+        on_bar()는 장중 실시간 bar이므로 gap_pct/rvol 정보가 없다.
+        일봉 25개를 한 번만 조회해 전일 종가 대비 당일 시가 갭과
+        장중 거래량을 전일 평균으로 나눈 RVOL을 산출, 하루 동안 재사용.
+        """
+        today = datetime.now(timezone.utc).date().isoformat()
+        cached = self._b3_daily_cache.get(symbol)
+        if cached and cached[2] == today:
+            return cached[0], cached[1]
+
+        gap_pct = 0.0
+        rvol    = 0.0
+        try:
+            daily = self._fetch_bars(symbol, "1Day", 25)
+            if daily is not None and len(daily) >= 2:
+                prev_close = float(daily["close"].iloc[-2])
+                if prev_close > 0 and not df_intraday.empty:
+                    today_open = float(df_intraday["open"].iloc[0])
+                    gap_pct = (today_open - prev_close) / prev_close * 100.0
+
+                avg_vol_20 = float(
+                    daily["volume"].rolling(20, min_periods=5).mean().iloc[-1] or 1
+                )
+                intraday_vol = float(df_intraday["volume"].sum()) if not df_intraday.empty else 0.0
+                bars_so_far  = max(len(df_intraday), 1)
+                projected_vol = intraday_vol * (78.0 / bars_so_far)   # 78 = 390min ÷ 5min
+                rvol = projected_vol / avg_vol_20 if avg_vol_20 > 0 else 0.0
+        except Exception as exc:
+            logging.debug("[B3] %s gap_data 산출 실패: %s", symbol, exc)
+
+        self._b3_daily_cache[symbol] = (gap_pct, rvol, today)
+        return gap_pct, rvol
 
     async def _get_account(self):
         from risk.guard import AccountState
@@ -416,6 +455,16 @@ class Orchestrator:
             if strategy == "etf_swing":
                 from strategy.b2_allocation import B2AllocMode as _B2M
                 if self.b2_alloc.current_mode == _B2M.DEFENSE_INDEX:
+                    # 인트라데이 손절: -8% 하드 스탑 (주봉 청산만 있어 손실 무제한 방치 버그 수정)
+                    defense_sl_pct = self.cfg.get("etf_swing", {}).get("long_sl_pct", 0.08)
+                    if entry > 0 and last <= entry * (1.0 - defense_sl_pct):
+                        stop_reason = (
+                            f"DEFENSE_INDEX 손절 -{defense_sl_pct*100:.0f}% "
+                            f"(진입 ${entry:.2f} → 현재 ${last:.2f})"
+                        )
+                        await asyncio.to_thread(self._do_exit, sym, qty, last, stop_reason, strategy)
+                        logging.info("[B2][DEFENSE] %s 손절 청산: %s", sym, stop_reason)
+                        continue
                     wk_exit, wk_reason = await asyncio.to_thread(
                         self.b2_alloc.check_weekly_exit, sym
                     )
@@ -987,8 +1036,9 @@ class Orchestrator:
 
         regime    = await asyncio.to_thread(analyze_market)
         close_val = float(getattr(bar, "close", 0) or 0)
-        # GapCandidate 생성 — 실시간 bar라 갭/RVOL 정보 없음 (기본값 0)
-        candidate = GapCandidate(symbol=symbol, atr=0.0, score=50.0)
+        # 일봉 기반 gap_pct/rvol 계산 (하루 1회 캐시) — 기본값 0 이면 모든 진입 필터 실패
+        gap_pct, rvol = await asyncio.to_thread(self._get_b3_gap_data, symbol, df)
+        candidate = GapCandidate(symbol=symbol, gap_pct=gap_pct, rvol=rvol, atr=0.0, score=50.0)
 
         # ── 1차 진입: Gap&Go (첫 5분봉 고점 돌파) ────────────────
         ok, price, stop, reason = await asyncio.to_thread(

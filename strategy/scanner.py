@@ -112,10 +112,22 @@ def _check_news_catalyst(symbol: str) -> tuple[bool, str]:
 
 def get_dynamic_universe(top_n: int = 50) -> List[str]:
     """
-    yfinance Screener로 당일 갭업/거래량 급증 종목 동적 수집.
-    day_gainers + most_actives 합산 후 중복 제거.
-    실패 시 빈 목록 반환 (기존 watchlist로 폴백).
+    실시간 카탈리스트 기반 동적 유니버스.
+
+    1순위: Alpaca News API — 최근 4시간 카탈리스트 종목 (FDA, earnings beat 등)
+    2순위: yfinance Screener fallback (day_gainers / most_actives)
     """
+    # 1순위: 뉴스 카탈리스트 종목 (오늘의 진짜 급등 후보)
+    try:
+        from data.news_universe import fetch_catalyst_symbols
+        news_syms = fetch_catalyst_symbols(hours=4, max_symbols=top_n)
+        if news_syms:
+            logging.info("[scanner] 뉴스 기반 동적 유니버스 %d종목", len(news_syms))
+            return news_syms[:top_n]
+    except Exception as exc:
+        logging.debug("[scanner] 뉴스 유니버스 실패: %s — Screener fallback", exc)
+
+    # 2순위: yfinance Screener (이미 급등 완료 종목 — 후순위)
     symbols: List[str] = []
     for screen in ("day_gainers", "most_actives"):
         try:
@@ -126,7 +138,6 @@ def get_dynamic_universe(top_n: int = 50) -> List[str]:
         except Exception as exc:
             logging.debug("[scanner] screener(%s) 실패: %s", screen, exc)
 
-    # 중복 제거 + 상위 N개
     seen: set = set()
     result: List[str] = []
     for sym in symbols:
@@ -137,7 +148,7 @@ def get_dynamic_universe(top_n: int = 50) -> List[str]:
             break
 
     if result:
-        logging.info("[scanner] 동적 유니버스 %d종목 수집", len(result))
+        logging.info("[scanner] Screener 폴백 유니버스 %d종목", len(result))
     return result
 
 

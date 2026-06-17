@@ -146,7 +146,7 @@ def compute_squeeze_momentum(
 
     # 스퀴즈 ON/OFF
     out["squeeze_on"]  = (bb_upper < kc_upper) & (bb_lower > kc_lower)
-    out["squeeze_off"] = out["squeeze_on"].shift(1).fillna(False) & ~out["squeeze_on"]
+    out["squeeze_off"] = out["squeeze_on"].shift(1, fill_value=False) & ~out["squeeze_on"]
 
     # 모멘텀 계산 (TTM 공식)
     highest_high = high.rolling(mom_period).max()

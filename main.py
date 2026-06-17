@@ -193,6 +193,25 @@ async def main() -> None:
     )
     logging.info("=" * 60)
 
+    # ── 뉴스 기반 초기 종목 발굴 (시작 시점 한 번) ────────────────────
+    # WebSocket 구독 전에 오늘 카탈리스트 종목을 미리 b3_syms에 추가
+    try:
+        from data.news_universe import fetch_catalyst_symbols
+        _news_init = fetch_catalyst_symbols(hours=6)
+        if _news_init:
+            _existing = set(b3_syms)
+            _added    = [s for s in _news_init if s not in _existing]
+            b3_syms   = b3_syms + _added
+            logging.info("[main] 뉴스 초기 종목 %d개 추가 → B3 유니버스 %d개", len(_added), len(b3_syms))
+    except Exception as _exc:
+        logging.debug("[main] 뉴스 초기 발굴 실패 (무시): %s", _exc)
+
+    # stream_update_fn: 9:40 스캔 후 신규 종목을 WebSocket에 동적 추가
+    # orch._stream은 run_bucket3_stream 태스크가 시작한 뒤 세팅됨 → lambda로 지연 참조
+    def _stream_update(syms: list[str]) -> None:
+        if orch._stream is not None:
+            orch._stream.add_symbols(syms)
+
     # ── 비동기 태스크 동시 실행 ───────────────────────────────────────
     tasks = [
         orch.run_exit_loop(),              # 30초 — 전 버킷 청산 체크
@@ -200,8 +219,8 @@ async def main() -> None:
         orch.run_bucket1_loop(b1_syms),    # 60분 — 가치주 장기
         orch.run_bucket2_loop(),           # 15분 — ETF 스윙 (or B2 동적 배분)
         orch.run_bucket3_stream(b3_syms),  # B3 — PollingStream(Toss) / WebSocket(Alpaca)
-        # 매일 9:20 ET 프리마켓 스캔 → B3/B2 레짐 전환 + 자금 재확인
-        orch.strategy_mgr.run_premarket_loop(b3_syms),
+        # 매일 9:40 ET 프리마켓 스캔 → B3/B2 레짐 전환 + 뉴스 신규 종목 WS 추가
+        orch.strategy_mgr.run_premarket_loop(b3_syms, stream_update_fn=_stream_update),
     ]
     # Toss 브로커: 세션 감시 워치독 추가 (세션 끊기면 킬스위치 + 텔레그램)
     if broker_type == "toss" and mode == "live":

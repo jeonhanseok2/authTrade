@@ -79,7 +79,7 @@ squeeze:
   max_positions: 3                 # $7,400 → 풀 2~3개 분할 운용
   # ── 프리마켓 갭업 스캐너 기준 ────────────────────────────────────
   # 실증 데이터: 진짜 급등주 갭업 평균 47%, RVOL 평균 26.7x
-  min_gap_pct: 20.0                # 최소 갭업 20% (4% 이상이면 Gap&Go 후보)
+  min_gap_pct: 4.0                 # 최소 갭업 4% (Gap&Go 후보 하한; 20%+ 종목이 이상적)
   min_rvol: 5.0                    # 프리마켓 최소 RVOL 5x
   min_rvol_intraday: 10.0          # 장중 진입 최소 RVOL 10x
   max_float_m: 50.0                # 최대 Float 5000만주 (소형주 위주)

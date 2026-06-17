@@ -27,9 +27,9 @@ ET = zoneinfo.ZoneInfo("America/New_York")
 B3_THRESHOLD = 5     # 신뢰도 ≥70점 후보 5개 이상 → B3
 # 모드 전환 동기화 대기 시간
 SYNC_WAIT_SECONDS = 60.0
-# 프리마켓 스캔 시각 (ET)
+# 스캔 시각 (ET): 장 개시 10분 후 — 실제 1분봉 확보 후 alpha 계산
 PREMARKET_SCAN_HOUR   = 9
-PREMARKET_SCAN_MINUTE = 20
+PREMARKET_SCAN_MINUTE = 40
 
 
 class MarketMode(Enum):

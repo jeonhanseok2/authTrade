@@ -140,7 +140,7 @@ class StrategyManager:
                     if (
                         now_et.weekday() < 5
                         and now_et.hour   == 9
-                        and now_et.minute == 20
+                        and now_et.minute == 40   # 장 개시 10분 후 — 실제 1분봉 기반 alpha 계산
                         and last_date != _date.today()
                     ):
                         prev_mode = self.current_mode

@@ -74,11 +74,22 @@ def fetch_bars(
         with _SEMAPHORE:
             resp = _get_client().get_stock_bars(req)
 
+        # .df: alpaca-py v0.35+에서 DataFrame 반환 (비어 있을 수 있음)
         bars = getattr(resp, "df", None)
-        if bars is None:
-            bars = resp.get(symbol)
         if bars is None or (hasattr(bars, "empty") and bars.empty):
-            return None
+            # fallback: dict-like 접근 (.get()은 미존재 — __getitem__ 사용)
+            try:
+                bar_list = resp[symbol]
+            except (KeyError, TypeError, AttributeError):
+                return None
+            if not bar_list:
+                return None
+            rows = [
+                {"open": b.open, "high": b.high, "low": b.low,
+                 "close": b.close, "volume": b.volume}
+                for b in bar_list
+            ]
+            return pd.DataFrame(rows) if rows else None
 
         if hasattr(bars, "reset_index"):
             bars = bars.reset_index(drop=True)

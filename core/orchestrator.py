@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+import pandas as pd
+from datetime import datetime, date as _date, timezone
 from typing import Any, Dict, List, Optional
 
 from core.kill_switch    import KillSwitch
@@ -112,6 +113,8 @@ class Orchestrator:
         )
         # 종목별 3분 룰 체크 완료 여부 (포지션 청산 시 제거)
         self._3min_checked: set = set()
+        # 당일 시가 캐시: symbol → (date, open_px) — 장 중 불변값 재조회 방지
+        self._open_price_cache: Dict[str, tuple] = {}
 
     # ──────────────────────────────────────────────────────────────────
     # 공통 유틸
@@ -171,23 +174,22 @@ class Orchestrator:
             return 0.0
 
     def _fetch_open_price(self, symbol: str) -> float:
-        """당일 시가 조회 — Daily 봉 Open 기준 (프리마켓 폭락 반영, 1분봉 아님)."""
-        df = self._fetch_bars(symbol, "1Day", 3)  # 3일치로 장 시작 전 상황도 커버
+        """당일 시가 조회 — Daily 봉 Open 기준 (프리마켓 폭락 반영, 1분봉 아님).
+
+        결과를 당일 내 캐싱: 시가는 장 중 불변이므로 30초 exit 사이클마다 API 재호출 불필요.
+        """
+        import zoneinfo
+        today_et = datetime.now(zoneinfo.ZoneInfo("America/New_York")).date()
+        cached = self._open_price_cache.get(symbol)
+        if cached and cached[0] == today_et:
+            return cached[1]
+
+        df = self._fetch_bars(symbol, "1Day", 3)
         if df is None or df.empty or "open" not in df.columns:
             return 0.0
-        # 타임스탬프 컬럼이 있으면 오늘자 봉만 선택 (장 시작 전엔 어제 봉이 마지막일 수 있음)
-        from datetime import date
-        import zoneinfo
-        today_et = date.today()  # 서버가 ET 기준이 아닐 수 있어 last row 사용 fallback
-        if "timestamp" in df.columns:
-            df["_date"] = pd.to_datetime(df["timestamp"]).dt.tz_convert(
-                zoneinfo.ZoneInfo("America/New_York")
-            ).dt.date
-            today_rows = df[df["_date"] == today_et]
-            if not today_rows.empty:
-                return float(today_rows.iloc[-1]["open"])
-        # fallback: 마지막 row (Daily 봉이므로 정규장 open = 프리마켓 반영)
-        return float(df.iloc[-1]["open"])
+        open_px = float(df.iloc[-1]["open"])
+        self._open_price_cache[symbol] = (today_et, open_px)
+        return open_px
 
     def _fetch_atr(self, symbol: str) -> float:
         df = self._fetch_bars(symbol, "1Day", 20)
@@ -201,11 +203,8 @@ class Orchestrator:
 
     def _fetch_bars(self, symbol: str, timeframe: str, limit: int):
         try:
-            import pandas as pd
-
             if self._is_toss():
                 # Toss API: 1m / 1d 만 지원 (5m 없음)
-                # "5Min" 요청은 1m × 5배 count로 같은 시간 범위 커버
                 if timeframe == "5Min":
                     toss_interval, toss_count = "1m", limit * 5
                 elif timeframe == "1Min":
@@ -217,26 +216,10 @@ class Orchestrator:
                     return None
                 return pd.DataFrame(candles)[["open", "high", "low", "close", "volume"]]
 
-            from alpaca.data.requests  import StockBarsRequest   # type: ignore
-            from alpaca.data.timeframe import TimeFrame, TimeFrameUnit  # type: ignore
+            # Alpaca: 세마포어·싱글턴이 적용된 공용 클라이언트 사용 (DataFrame or 버그 회피)
+            from data.alpaca_bars import fetch_bars as _ab_fetch
+            return _ab_fetch(symbol, timeframe, limit)
 
-            tf_map = {
-                "1Min": TimeFrame(1,  TimeFrameUnit.Minute),
-                "5Min": TimeFrame(5,  TimeFrameUnit.Minute),
-                "1Day": TimeFrame(1,  TimeFrameUnit.Day),
-            }
-            tf  = tf_map.get(timeframe, TimeFrame(1, TimeFrameUnit.Day))
-            req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=tf, limit=limit)
-            resp = self.data_client.get_stock_bars(req)
-
-            bars = getattr(resp, "df", None) or resp.get(symbol)
-            if bars is None or (hasattr(bars, "empty") and bars.empty):
-                return None
-            if hasattr(bars, "reset_index"):
-                return bars.reset_index(drop=True)
-            rows = [{"open": b.open, "high": b.high, "low": b.low,
-                     "close": b.close, "volume": b.volume} for b in bars]
-            return pd.DataFrame(rows)
         except Exception as exc:
             logging.debug("[orchestrator] bars 조회 실패 %s/%s: %s", symbol, timeframe, exc)
             return None
@@ -380,6 +363,8 @@ class Orchestrator:
                 await asyncio.to_thread(self.db.update_peak, sym, last)
                 peak = last
 
+            atr_now = 0.0   # squeeze 블록에서 갱신; 다른 전략은 _check_exit_reason 내부에서 조회
+
             # ── 3분 룰: 진입 후 3분 이내 수익 미달 → 절반 매도 ─────
             if strategy == "squeeze" and sym not in self._3min_checked:
                 entry_ts_str = pos.get("entry_ts", "")
@@ -472,8 +457,10 @@ class Orchestrator:
                 # HOLD → _check_exit_reason 로 폴스루
 
             cfg_b = self.cfg.get(strategy, self.cfg.get("risk", {}))
+            # squeeze는 위에서 atr_now를 이미 조회했으므로 재사용 (중복 API 호출 방지)
+            _atr_hint = atr_now if strategy == "squeeze" else None
             reason = await asyncio.to_thread(
-                self._check_exit_reason, sym, entry, last, peak, cfg_b, strategy, now
+                self._check_exit_reason, sym, entry, last, peak, cfg_b, strategy, now, _atr_hint
             )
             if reason:
                 # 분배 감지 → 부분 청산 후 포지션 유지 (전량 청산 아님)
@@ -494,7 +481,8 @@ class Orchestrator:
                         self._stream.release(sym)
 
     def _check_exit_reason(
-        self, sym, entry, last, peak, cfg, strategy, now
+        self, sym, entry, last, peak, cfg, strategy, now,
+        atr: float = 0.0,   # 이미 조회된 ATR 재사용 (squeeze는 _exit_cycle에서 전달)
     ) -> Optional[str]:
         """모든 청산 조건 확인 — 동기 실행 (to_thread 내)."""
         stop_pct = float(cfg.get("stop_loss_pct", 0.05))
@@ -504,8 +492,9 @@ class Orchestrator:
         if open_px and hard_stop_gap_down(entry, open_px, stop_pct):
             return "hard_stop_gap_down"
 
-        # 2. 고정손절 vs ATR손절 — 더 타이트한 쪽 우선
-        atr     = self._fetch_atr(sym)
+        # 2. 고정손절 vs ATR손절 — 더 타이트한 쪽 우선 (atr=0이면 내부 조회)
+        if atr <= 0.0:
+            atr = self._fetch_atr(sym)
         atr_mul = float(cfg.get("atr_multiplier", 2.0))
         eff_stop = effective_stop_price(entry, stop_pct, peak, atr, atr_mul)
         if last <= eff_stop:

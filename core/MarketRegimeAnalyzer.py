@@ -24,8 +24,9 @@ from strategy.confidence_scanner import ConfidenceScanner, ConfidenceScore
 from strategy.news_analyzer      import NewsAnalyzer
 
 ET                    = zoneinfo.ZoneInfo("America/New_York")
+# 9:40 ET: 장 개시 10분 후 → 실제 1분봉 10개 확보, QQQ alpha 계산 가능
 PREMARKET_SCAN_HOUR   = 9
-PREMARKET_SCAN_MINUTE = 20
+PREMARKET_SCAN_MINUTE = 40
 SCAN_MAX_SYMBOLS      = 50
 SCAN_INTERVAL_SEC     = 30
 
@@ -102,44 +103,45 @@ class MarketRegimeAnalyzer:
         df_fetcher=None,
     ) -> ScanResult:
         """
-        신뢰도 스캔 → 모드 결정.
+        신뢰도 스캔 → 모드 결정 (병렬 처리).
 
         df_fetcher: async callable(symbol) -> pd.DataFrame | None
-                    미제공 시 Alpaca 직접 조회.
+                    미제공 시 Alpaca 직접 조회 (세마포어 10 적용).
+        호출 시각: 9:40 ET — 장 개시 10분 후 실제 1분봉 기반 alpha 계산 가능.
         """
         from data.alpaca_bars import fetch_bars
 
-        scores: Dict[str, ConfidenceScore] = {}
-        qualified = 0
-
-        for sym in scan_symbols[:SCAN_MAX_SYMBOLS]:
+        async def _scan_one(sym: str):
             try:
-                if df_fetcher:
-                    df = await df_fetcher(sym)
-                else:
-                    df = await asyncio.to_thread(fetch_bars, sym, "1Min", 390)
-
+                df = await df_fetcher(sym) if df_fetcher else \
+                     await asyncio.to_thread(fetch_bars, sym, "1Min", 390)
                 if df is None or df.empty:
-                    continue
-
+                    return None
                 sc = await asyncio.to_thread(self._scanner.score, sym, df)
-
-                # 뉴스 심리 보정: 최종 신뢰도 = 차트×0.7 + 뉴스×0.3
                 effective_score = sc.total
                 if self._news:
                     if self._news.is_blocked(sym):
-                        logging.info("[MarketRegimeAnalyzer] %s 뉴스 차단 — 스킵", sym)
-                        continue
+                        return None
                     effective_score = await asyncio.to_thread(
                         self._news.blend, sym, sc.total
                     )
-
-                if effective_score >= 70:   # 보정 후 기준으로 판단
-                    scores[sym] = sc
-                    qualified += 1
-
+                return (sym, sc) if effective_score >= 70 else None
             except Exception as exc:
                 logging.debug("[MarketRegimeAnalyzer] %s 스캔 실패: %s", sym, exc)
+                return None
+
+        # 세마포어(10)로 자동 throttle되므로 gather로 병렬 실행
+        raw = await asyncio.gather(
+            *[_scan_one(s) for s in scan_symbols[:SCAN_MAX_SYMBOLS]],
+            return_exceptions=False,
+        )
+        scores: Dict[str, ConfidenceScore] = {}
+        qualified = 0
+        for item in raw:
+            if item:
+                sym, sc = item
+                scores[sym] = sc
+                qualified += 1
 
         now_et = datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")
         mode   = self._regime.detect_mode(qualified)

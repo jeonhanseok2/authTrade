@@ -110,13 +110,19 @@ def _fetch_spx_series() -> Optional[pd.Series]:
 
 def _compute_yield_curve() -> float:
     """
-    10Y - 2Y 스프레드 (bp).
+    10Y - 13W 스프레드 (bp). yf.download() 배치로 2개 티커를 1회 요청.
     역전(음수) = 경기침체 선행 지표.
     """
     try:
-        t10 = _fetch_last_price("^TNX")   # 10년물 금리 (%)
-        # 2년물이 없으면 SHY ETF yield를 대략 대체 (편의상 0 처리)
-        t2  = _fetch_last_price("^IRX")   # 13주물 T-Bill (2Y 근사)
+        raw = yf.download(
+            ["^TNX", "^IRX"], period="5d", interval="1d",
+            progress=False, auto_adjust=True, timeout=10,
+        )
+        if raw.empty:
+            return 0.0
+        closes = raw["Close"] if "Close" in raw.columns else raw
+        t10 = float(closes["^TNX"].dropna().iloc[-1]) if "^TNX" in closes else 0.0
+        t2  = float(closes["^IRX"].dropna().iloc[-1]) if "^IRX" in closes else 0.0
         if t10 > 0 and t2 > 0:
             return round(t10 - t2, 3)
     except Exception as exc:
@@ -126,39 +132,54 @@ def _compute_yield_curve() -> float:
 
 def _fetch_sector_returns(period_days: int = 20) -> Dict[str, float]:
     """
-    섹터 ETF의 최근 N일 수익률(%) 반환.
-    기준: SPY 대비 초과 수익으로 섹터 로테이션 파악.
+    섹터 ETF 최근 N일 수익률(%) — yf.download() 배치로 12개 티커를 1회 요청.
+    기존: Ticker().history() × 12회 → Yahoo 429 유발
+    개선: download([SPY, XLK, ...]) 1회 → 요청 수 92% 감소
     """
+    all_tickers = ["SPY"] + list(_SECTOR_ETFS.values())
     results: Dict[str, float] = {}
-    spy_ret = None
     try:
-        spy_s = _fetch_price_series("SPY", period="3mo", interval="1d")
+        raw = yf.download(
+            all_tickers, period="3mo", interval="1d",
+            progress=False, auto_adjust=True, timeout=15,
+        )
+        if raw.empty:
+            return results
+        # yf.download() 다중 티커: columns = MultiIndex (Price, Ticker)
+        closes = raw["Close"] if "Close" in raw.columns else raw
+        spy_s  = closes["SPY"].dropna() if "SPY" in closes else None
+        spy_ret = None
         if spy_s is not None and len(spy_s) >= period_days:
             spy_ret = float(spy_s.iloc[-1] / spy_s.iloc[-period_days] - 1) * 100
-    except Exception:
-        pass
 
-    for sector_name, ticker in _SECTOR_ETFS.items():
-        try:
-            s = _fetch_price_series(ticker, period="3mo", interval="1d")
-            if s is None or len(s) < period_days:
+        for sector_name, ticker in _SECTOR_ETFS.items():
+            try:
+                if ticker not in closes:
+                    continue
+                s = closes[ticker].dropna()
+                if len(s) < period_days:
+                    continue
+                ret = float(s.iloc[-1] / s.iloc[-period_days] - 1) * 100
+                results[sector_name] = round(ret - spy_ret, 2) if spy_ret is not None else round(ret, 2)
+            except Exception:
                 continue
-            ret = float(s.iloc[-1] / s.iloc[-period_days] - 1) * 100
-            # SPY 대비 초과 수익 (없으면 절대 수익률)
-            results[sector_name] = round(ret - spy_ret, 2) if spy_ret is not None else round(ret, 2)
-        except Exception:
-            continue
+    except Exception as exc:
+        logging.debug("[market] sector returns error: %s", exc)
     return results
 
 
 def analyze_market() -> MarketRegime:
     """
-    시장 레짐 종합 분석.
+    시장 레짐 종합 분석 (5분 TTL 캐시 적용 — 중복 루프 호출 대비).
     - SPX 200MA 위치 확인
     - VIX 레벨 확인
     - 수익률 곡선 역전 여부
     - 섹터 강도 분석
     """
+    return _cached("regime_result", _analyze_market_impl)
+
+
+def _analyze_market_impl() -> MarketRegime:
     result = MarketRegime()
 
     # ── SPX 트렌드 ────────────────────────────────────────────────

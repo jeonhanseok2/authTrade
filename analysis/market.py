@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional
@@ -45,18 +46,26 @@ _SECTOR_ETFS = {
     "소재":       "XLB",
 }
 
-# 캐시 (5분 TTL)
+# 캐시 (5분 TTL) — double-checked locking으로 스레드 안전 보장
 _CACHE: Dict[str, tuple] = {}
-_CACHE_TTL = 300
+_CACHE_LOCK = threading.Lock()
+_CACHE_TTL  = 300
 
 
 def _cached(key: str, fn, *args):
     now = time.time()
-    if key in _CACHE and (now - _CACHE[key][0]) < _CACHE_TTL:
-        return _CACHE[key][1]
-    val = fn(*args)
-    _CACHE[key] = (now, val)
-    return val
+    # 빠른 경로: 락 없이 캐시 확인
+    entry = _CACHE.get(key)
+    if entry and (now - entry[0]) < _CACHE_TTL:
+        return entry[1]
+    # 느린 경로: 락 획득 후 이중 확인 — 대기 중 다른 스레드가 채웠을 수 있음
+    with _CACHE_LOCK:
+        entry = _CACHE.get(key)
+        if entry and (now - entry[0]) < _CACHE_TTL:
+            return entry[1]
+        val = fn(*args)
+        _CACHE[key] = (time.time(), val)
+        return val
 
 
 @dataclass

@@ -98,7 +98,9 @@ class Bucket3Stream:
         self._stream.subscribe_quotes(_quote_handler, *all_syms)
 
         logging.info("[WS] 스트림 시작 — 진입감시: %d, Spread감시: %d", len(self._watch), len(self._hold))
-        await self._stream.run()
+        # stream.run()은 내부에서 asyncio.run()을 호출 → 이미 실행 중인 이벤트 루프와 충돌.
+        # _run_forever()는 run()이 래핑하는 순수 async 메서드이므로 직접 await 가능.
+        await self._stream._run_forever()
 
     async def stop(self) -> None:
         if self._stream:

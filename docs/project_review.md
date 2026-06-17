@@ -1,5 +1,5 @@
 # authTrade — 사계절 퀀트 엔진 구조 및 매매 원칙 요약
-> 교차 검증용 문서. 최종 업데이트: 2026-06-16 (Paper Trading 준비 반영)
+> 교차 검증용 문서. 최종 업데이트: 2026-06-17 (B4 스나이퍼 모드 콜옵션 버전 + analyzer.py 반영)
 
 ---
 
@@ -12,7 +12,8 @@
   ├─ run_bucket1_loop()      60분 — 가치주 장기
   ├─ run_bucket2_loop()      15분 — ETF 스윙 or B2 동적 배분
   ├─ run_bucket3_stream()    이벤트 — WebSocket(Alpaca) / 1초 폴링(Toss)
-  └─ strategy_mgr.run_premarket_loop()  30초 체크 — 매일 9:20 ET 스캔
+  ├─ strategy_mgr.run_premarket_loop()  30초 체크 — 매일 9:20 ET 스캔
+  └─ run_b4_sniper_mode()    10:00 ET — QQQ/SPY 0DTE ATM 콜옵션 인트라데이 (독립 태스크)
 
 [3대 관심사 분리 모듈]
   ├─ MarketRegimeAnalyzer  시장 상태 진단 (RegimeEngine + ConfidenceScanner + NewsAnalyzer)
@@ -34,7 +35,7 @@
 
 [DB 이중 구조]
   storage/db.py          → PositionDB (포지션/거래/손익 — 기존)
-  storage/db_manager.py  → trades/market_log/system_state (사계절 엔진 전용)
+  storage/db_manager.py  → trades/market_log/system_state/b4_trades/b4_cooldown (사계절 + B4)
 
 [브로커]
   BROKER=alpaca (기본): Alpaca Markets API + WebSocket
@@ -141,11 +142,13 @@ trades     (id, symbol, side, qty, price, strategy, reason, ts)
 daily_pnl  (date PK, realized, unrealized)
 ```
 
-### storage/db_manager.py — 사계절 엔진 전용
+### storage/db_manager.py — 사계절 엔진 + B4 전용
 ```sql
 trades       (id, symbol, buy_price, sell_price, quantity, mode, result, timestamp)
 market_log   (id, date, nasdaq_ma20, regime, scanner_score, timestamp)
 system_state (key PK, value)
+b4_trades    (id, symbol, buy_price, sell_price, qty, result_pct, exit_reason, trade_date, timestamp)
+b4_cooldown  (id, start_date, end_date, reason, created_at)
 ```
 
 **system_state 주요 키**
@@ -155,9 +158,106 @@ system_state (key PK, value)
 | ACTIVE_GROUP | A |
 | B2_ALLOC_MODE | BULL_LEVERAGE |
 
+**b4_trades 주요 필드**
+| 컬럼 | 타입 | 설명 |
+|------|------|------|
+| symbol | TEXT | OCC 옵션 심볼 (예: `QQQ240621C00490000`) |
+| result_pct | DECIMAL | 손익률 (0.50 = +50%, -0.20 = -20%) |
+| exit_reason | TEXT | 청산 사유 (`트레일링청산` / `초기손절` / `부분익절` / `타임스탑`) |
+| trade_date | TEXT | 거래일 (YYYY-MM-DD ET, 쿨다운 계산 기준) |
+
 ---
 
-## 7. 리스크 관리
+## 7. B4 스나이퍼 모드 (콜옵션 버전)
+
+> `strategy/strategy_engine.py` — 모듈 레벨 독립 비동기 태스크 `run_b4_sniper_mode()`
+
+**전략 개요**
+- 타겟: QQQ, SPY (기초자산) → 해당 종목 콜옵션 매매
+- 컨셉: 당일 변동성이 터지는 날 콜옵션 감마 폭발로 수익 극대화 + 프리미엄 소멸 리스크 초기 차단
+
+**진입 조건 (AND)**
+- 10:00 ET 이후 (감마 폭발 유효 윈도우)
+- 기초자산 RVOL ≥ 250% (5분봉 기준)
+- VIX 전일 종가 대비 변화율 ≤ 0 (VIX 하락 또는 횡보 — 고변동성 확장 구간 차단)
+- 쿨다운 비활성 상태
+
+**계약 선택**
+- Alpaca Options API `GetOptionContractsRequest` → 만기 0~2일(0DTE~2DTE) ATM 콜 선택
+- OCC 심볼 동적 생성 (예: `QQQ240621C00490000`)
+- 진입 프리미엄 = (bid + ask) / 2 via `OptionHistoricalDataClient`
+
+**자금 관리**
+- 투입 자본: Settled Cash의 50%
+- 계약 수 = 투입 자본 ÷ (프리미엄 × 100)
+
+**청산 로직 (하이브리드 래칫 스탑)**
+
+| 단계 | 조건 | 동작 |
+|------|------|------|
+| 초기 손절 | PnL ≤ -20% | 즉시 전량 청산 |
+| 본절 이동 | PnL ≥ +30% | 스탑 → 진입가(본절) 이동 |
+| 부분 익절 | PnL ≥ +50% | 보유 계약 50% 매도, 트레일링 스탑 전환 |
+| 와이드 트레일링 | 부분익절 후 | 고점 대비 -15% 추적 |
+| 래칫 Step 1 | PnL ≥ +100% | 스탑 플로어 → 진입가 × 1.70 |
+| 래칫 Step 2 | PnL ≥ +200% | 스탑 플로어 → 진입가 × 2.50 |
+| 타임 스탑 | 15:30 ET | 잔여 계약 전량 강제 청산 |
+
+> 래칫 원칙: 스탑가는 오직 상승만 (`max(새 플로어, 현재 스탑)`)
+
+**쿨다운 시스템**
+- 3거래일 연속 일간 합산 손익 < 0 → 2거래일 B4 중지
+- `db_manager.is_b4_cooldown_active()` / `set_b4_cooldown()`으로 상태 관리
+
+**모듈 레벨 상수** (`strategy/strategy_engine.py`)
+```python
+_B4_OPT_UNIVERSE = ["QQQ", "SPY"]
+_B4O_RVOL_MIN    = 2.50   # RVOL 250%
+_B4O_TRAIL_DIST  = 0.15   # 트레일링 -15%
+_B4O_INIT_SL     = 0.20   # 초기 손절 -20%
+_B4O_PARTIAL_AT  = 0.50   # 부분익절 +50%
+_B4O_CAPITAL     = 0.50   # Settled Cash 50% 투입
+```
+
+---
+
+## 8. 파라미터 최적화 — analyzer.py
+
+> `analyzer.py` — 페이퍼 트레이딩 데이터 분석 및 파라미터 튜닝 제안 CLI
+
+**주요 기능**
+
+1. **통합 지표 계산**: `closed_trades`(B1/B2/B3) + `b4_trades`(B4) → 버킷별 승률/PF/기대값
+2. **B4 파라미터 매트릭스**: RVOL 필터(200/250/300%) × 트레일링 스탑(-10/-15/-20%) 3×3 시뮬레이션
+3. **설정값 비교**: `config.yaml` 현재값 vs 최적값(승률 ≥50% + N≥10) 비교
+4. **추천 로그**: `recommendations.log`에 구체적 변경 제안 저장
+5. **텔레그램 알림**: `notify/telegram_notifier.py`를 통해 요약 전송
+
+**CLI 사용법**
+```bash
+python analyzer.py                      # 전체 분석 (최근 30일)
+python analyzer.py --days 14            # 최근 14일
+python analyzer.py --bucket b4          # B4만 집중 분석
+python analyzer.py --notify             # 텔레그램 알림 포함
+python analyzer.py --days 30 --notify   # 조합 가능
+```
+
+**최적 기준**
+- 승률 ≥ 50% AND 거래 수 ≥ 10 → 현행 유지
+- 거래 수 < 10 → "샘플 부족으로 튜닝 불가" (비실행 제안)
+
+**recommendations.log 형식 예시**
+```
+[1] [HIGH] B4 — TRAILING_STOP (trail_dist)
+     현재값: -15%
+     제안값: -10%
+     근거  : 트레일링 스탑 변경 시 평균 수익률 최대화 (시뮬레이션 기반)
+     기대  : 트레일링 -15% → -10% → 평균 수익 +3.2%p 개선 기대
+```
+
+---
+
+## 9. 리스크 관리
 
 ### 계좌 레벨
 | 규칙 | 수치 | 동작 |
@@ -176,7 +276,7 @@ system_state (key PK, value)
 
 ---
 
-## 8. Paper Trading 모드
+## 10. Paper Trading 모드
 
 ### 슬리피지 시뮬레이션
 
@@ -229,7 +329,7 @@ dbm.init_db()   # storage/db/trading_data.db 자동 생성
 
 ---
 
-## 10. 텔레그램 명령어
+## 11. 텔레그램 명령어
 
 | 명령어 | 기능 |
 |--------|------|
@@ -246,7 +346,7 @@ dbm.init_db()   # storage/db/trading_data.db 자동 생성
 
 ---
 
-## 11. 데이터 흐름
+## 12. 데이터 흐름
 
 ```
 Alpaca Markets API   → 실시간 가격/거래량/뉴스
@@ -261,20 +361,22 @@ Telegram Bot         → 실시간 알림 + 수동 제어
 
 ---
 
-## 12. 핵심 파일 목록
+## 13. 핵심 파일 목록
 
 | 경로 | 역할 |
 |------|------|
+| `main.py` | 진입점 + asyncio.gather (7개 태스크) |
+| `core/orchestrator.py` | 비동기 태스크 조율 |
 | `core/MarketRegimeAnalyzer.py` | 시장 상태 진단 (프리마켓 스캔 + 뉴스 보정) |
 | `core/StrategyManager.py` | 전략 전환 엔진 (B3/B2 + sync lock) |
 | `core/AccountManager.py` | 계좌 자금 관리 (A/B + Settled Cash) |
-| `core/orchestrator.py` | 비동기 태스크 조율 |
 | `core/regime_engine.py` | B3/B2 모드 감지 + 전환 |
+| `strategy/strategy_engine.py` | B1~B3 통합 인터페이스 + **B4 스나이퍼 모드 (콜옵션)** |
 | `strategy/news_analyzer.py` | 뉴스 수집 + Gemini 심리 분석 + 차단 |
 | `strategy/confidence_scanner.py` | RVOL/Alpha/VWAP 100점 스코어러 |
 | `strategy/exit_strategy.py` | 4-레이어 청산 엔진 (개미털기 방어) |
 | `strategy/b2_allocation.py` | B2 내부 동적 배분 (BULL/DEFENSE/CASH) |
-| `strategy/strategy_engine.py` | 통합 인터페이스 (진입/청산 DB 자동 저장) |
-| `storage/db_manager.py` | trades/market_log/system_state CRUD |
-| `storage/db.py` | PositionDB (포지션 저널) |
-| `main.py` | 진입점 + asyncio.gather |
+| `storage/db.py` | PositionDB (포지션 저널 — B1/B2/B3) |
+| `storage/db_manager.py` | trades/market_log/system_state/**b4_trades/b4_cooldown** CRUD |
+| **`analyzer.py`** | **페이퍼 데이터 분석 + 파라미터 튜닝 제안 CLI** |
+| `notify/telegram_notifier.py` | 텔레그램 단방향 알림 (`send_telegram(text)`) |

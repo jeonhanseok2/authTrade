@@ -15,21 +15,29 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from typing import Optional
 
 import pandas as pd
 
-_CLIENT = None
+_CLIENT      = None
+_CLIENT_LOCK = threading.Lock()
+# B1·B2·B3·뉴스 동시 호출 시 in-flight HTTP 요청 상한 (Alpaca free: 200 req/min)
+_SEMAPHORE   = threading.Semaphore(10)
 
 
 def _get_client():
+    """싱글턴 StockHistoricalDataClient — 이중 확인 잠금으로 스레드 안전 초기화."""
     global _CLIENT
-    if _CLIENT is None:
-        from alpaca.data.historical import StockHistoricalDataClient
-        _CLIENT = StockHistoricalDataClient(
-            os.getenv("ALPACA_API_KEY", ""),
-            os.getenv("ALPACA_SECRET_KEY", ""),
-        )
+    if _CLIENT is not None:
+        return _CLIENT
+    with _CLIENT_LOCK:
+        if _CLIENT is None:
+            from alpaca.data.historical import StockHistoricalDataClient
+            _CLIENT = StockHistoricalDataClient(
+                os.getenv("ALPACA_API_KEY", ""),
+                os.getenv("ALPACA_SECRET_KEY", ""),
+            )
     return _CLIENT
 
 
@@ -62,7 +70,9 @@ def fetch_bars(
         }
         tf  = tf_map.get(timeframe, TimeFrame(1, TimeFrameUnit.Day))
         req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=tf, limit=limit)
-        resp = _get_client().get_stock_bars(req)
+
+        with _SEMAPHORE:
+            resp = _get_client().get_stock_bars(req)
 
         bars = getattr(resp, "df", None)
         if bars is None:

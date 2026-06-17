@@ -53,6 +53,29 @@ CREATE TABLE IF NOT EXISTS system_state (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- 4. B4 스나이퍼 모드 거래 기록
+CREATE TABLE IF NOT EXISTS b4_trades (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol      TEXT           NOT NULL,
+    buy_price   DECIMAL(18, 8) NOT NULL,
+    sell_price  DECIMAL(18, 8) NOT NULL,
+    qty         INTEGER        NOT NULL,
+    result_pct  DECIMAL(18, 8) NOT NULL,   -- 손익률 (0.05 = +5%)
+    exit_reason TEXT           DEFAULT '',
+    trade_date  TEXT           NOT NULL,   -- YYYY-MM-DD ET (연패 계산 기준)
+    timestamp   DATETIME       DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_b4_trades_date ON b4_trades(trade_date);
+
+-- 5. B4 쿨다운 상태 (3거래일 연속 손절 → 2거래일 중지)
+CREATE TABLE IF NOT EXISTS b4_cooldown (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    start_date  TEXT    NOT NULL,
+    end_date    TEXT    NOT NULL,   -- 이 날(포함)까지 B4 중지
+    reason      TEXT    DEFAULT '',
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
@@ -209,3 +232,97 @@ def get_all_system_states() -> Dict[str, str]:
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(sql).fetchall()
     return {r[0]: r[1] for r in rows}
+
+
+# ── B4 스나이퍼 모드 (옵션 버전) ─────────────────────────────────────
+
+def save_b4_trade(
+    symbol:      str,
+    buy_price:   float,
+    sell_price:  float,
+    qty:         int,
+    result_pct:  float,
+    exit_reason: str,
+    trade_date:  str,
+) -> int:
+    """
+    B4 거래 결과 저장 (진입+청산 완료 시 1회 호출).
+
+    Args:
+        symbol:      옵션 OCC 심볼 (예: "QQQ240621C00490000")
+        buy_price:   계약당 진입 프리미엄
+        sell_price:  계약당 청산 프리미엄
+        qty:         계약 수
+        result_pct:  손익률 (0.50 = +50%, -0.20 = -20%)
+        exit_reason: 청산 사유
+        trade_date:  거래일 (YYYY-MM-DD ET, 쿨다운 계산 기준)
+    """
+    sql = """
+        INSERT INTO b4_trades
+        (symbol, buy_price, sell_price, qty, result_pct, exit_reason, trade_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(sql, (symbol, buy_price, sell_price, qty,
+                                 result_pct, exit_reason, trade_date))
+        conn.commit()
+    logging.debug("[db_manager] save_b4_trade: %s result=%.2f%% qty=%d",
+                  symbol, result_pct * 100, qty)
+    return cur.lastrowid
+
+
+def get_b4_consecutive_loss_days() -> int:
+    """
+    최근 B4 거래일 중 연속 손절(일간 합산 손익 < 0) 일수 반환.
+
+    3 이상 반환 → 쿨다운 트리거.
+    """
+    sql = """
+        SELECT trade_date, SUM(result_pct) AS daily_pnl
+        FROM b4_trades
+        GROUP BY trade_date
+        ORDER BY trade_date DESC
+        LIMIT 10
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(sql).fetchall()
+
+    consecutive = 0
+    for _, daily_pnl in rows:
+        if daily_pnl is not None and float(daily_pnl) < 0:
+            consecutive += 1
+        else:
+            break
+    return consecutive
+
+
+def is_b4_cooldown_active() -> bool:
+    """현재 B4 쿨다운 상태 여부 (end_date >= 오늘이면 활성)."""
+    sql = "SELECT COUNT(*) FROM b4_cooldown WHERE end_date >= DATE('now')"
+    with sqlite3.connect(DB_PATH) as conn:
+        count = conn.execute(sql).fetchone()[0]
+    return count > 0
+
+
+def set_b4_cooldown(reason: str = "", trading_days: int = 2) -> None:
+    """쿨다운 설정 (N 거래일 후까지 B4 중지)."""
+    from datetime import date
+    today = date.today()
+    end   = _next_n_trading_days(today, trading_days)
+    sql   = "INSERT INTO b4_cooldown (start_date, end_date, reason) VALUES (?, ?, ?)"
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(sql, (str(today), str(end), reason))
+        conn.commit()
+    logging.warning("[db_manager] B4 쿨다운: %s ~ %s | %s", today, end, reason)
+
+
+def _next_n_trading_days(from_date, n: int):
+    """from_date 로부터 n 거래일(월~금) 이후 날짜."""
+    from datetime import timedelta
+    d = from_date
+    added = 0
+    while added < n:
+        d += timedelta(days=1)
+        if d.weekday() < 5:   # Mon–Fri
+            added += 1
+    return d

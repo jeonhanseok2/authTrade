@@ -213,6 +213,8 @@ async def main() -> None:
             orch._stream.add_symbols(syms)
 
     # ── 비동기 태스크 동시 실행 ───────────────────────────────────────
+    from strategy.strategy_engine import run_b4_sniper_mode as _run_b4
+
     tasks = [
         orch.run_exit_loop(),              # 30초 — 전 버킷 청산 체크
         orch.run_monitor_loop(),           # 60초 — 킬스위치 + VIX RoC
@@ -221,6 +223,8 @@ async def main() -> None:
         orch.run_bucket3_stream(b3_syms),  # B3 — PollingStream(Toss) / WebSocket(Alpaca)
         # 매일 9:40 ET 프리마켓 스캔 → B3/B2 레짐 전환 + 뉴스 신규 종목 WS 추가
         orch.strategy_mgr.run_premarket_loop(b3_syms, stream_update_fn=_stream_update),
+        # B4 스나이퍼 모드 — QQQ/SPY 0DTE ATM 콜옵션 인트라데이 (독립 태스크)
+        _run_b4(broker, notify=getattr(orch, "_notify", None)),
     ]
     # Toss 브로커: 세션 감시 워치독 추가 (세션 끊기면 킬스위치 + 텔레그램)
     if broker_type == "toss" and mode == "live":

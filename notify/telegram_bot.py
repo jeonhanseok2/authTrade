@@ -131,16 +131,15 @@ except Exception:
 from trader.paper import PaperSimBroker
 from alpaca.data.historical import StockHistoricalDataClient
 
-# ── OpenAI ───────────────────────────────────────────────────────────
+# ── Gemini ───────────────────────────────────────────────────────────
 
-def ask_gpt(prompt: str) -> str:
-    """Gemini Flash로 질문에 답변."""
-    try:
-        from ai.gemini_helper import call_gemini, GeminiTask
-        result = call_gemini(prompt, task=GeminiTask.STOCK_ANALYSIS, max_tokens=256)
-        return result or "응답 없음 (Gemini 오류)"
-    except Exception as e:
-        return f"Gemini 호출 실패: {e}"
+try:
+    from ai.gemini_helper import ask_gpt
+except Exception as _e:
+    logging.warning("[telegram_bot] ai.gemini_helper import 실패: %s", _e)
+
+    def ask_gpt(prompt: str, max_tokens: int = 256) -> str:  # type: ignore[misc]
+        return f"Gemini 모듈 로드 실패 — ai/gemini_helper.py 확인 필요"
 
 
 # ── 텔레그램 유틸 ─────────────────────────────────────────────────────
@@ -313,8 +312,8 @@ def main():
     allow_ids = [x.strip() for x in allow_env.split(",") if x.strip()]
 
     logging.info("mode=%s | TG_TOKEN=%s | allow_ids=%s", mode, "set" if bot_token else "missing", allow_ids)
-    logging.info("OPENAI_KEY=%s model=%s", "set" if os.getenv("OPENAI_API_KEY") else "missing",
-                 os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+    logging.info("GEMINI_KEY=%s flash=%s", "set" if os.getenv("GEMINI_API_KEY") else "missing",
+                 os.getenv("GEMINI_FLASH_MODEL", "gemini-2.0-flash"))
 
     if not bot_token:
         logging.error("TELEGRAM_BOT_TOKEN 미설정")
@@ -486,8 +485,8 @@ def main():
 
             if cmd == "/gptstatus":
                 ok = bool(os.getenv("GEMINI_API_KEY"))
-                flash = os.getenv("GEMINI_FLASH_MODEL", "gemini-1.5-flash")
-                pro   = os.getenv("GEMINI_PRO_MODEL",   "gemini-1.5-pro")
+                flash = os.getenv("GEMINI_FLASH_MODEL", "gemini-2.0-flash")
+                pro   = os.getenv("GEMINI_PRO_MODEL",   "gemini-2.5-pro")
                 tg_send(bot_token, chat_id,
                         f"GEMINI_KEY: {'OK' if ok else 'MISSING'}\n"
                         f"Flash: {flash}\n"

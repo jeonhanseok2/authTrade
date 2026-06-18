@@ -2,13 +2,16 @@
 """
 Google Gemini 듀얼 모델 라우터.
 
+SDK: google-genai (google.genai) — 구 google.generativeai 대체
+  pip install google-genai
+
 모델 선택 원칙:
-  Flash  (gemini-1.5-flash) — 빠르고 저렴, 일상적 분석에 사용
+  Flash  (gemini-2.0-flash) — 빠르고 저렴, 일상적 분석에 사용
     · 뉴스 요약, 시장 동향 브리핑
     · 종목 간단 분석, 실적 해설
     · 텔레그램 알림 메시지 생성
 
-  Pro    (gemini-1.5-pro)   — 강력한 추론, 고비용 → 꼭 필요할 때만 호출
+  Pro    (gemini-2.5-pro)   — 강력한 추론, 고비용 → 꼭 필요할 때만 호출
     · 매매 전략 수정 / 파라미터 조정 권고
     · 포트폴리오 리밸런싱 판단
     · 큰 손실 발생 시 원인 분석 + 대응 전략
@@ -16,14 +19,15 @@ Google Gemini 듀얼 모델 라우터.
     · 여러 지표가 충돌할 때 최종 판단
 
 환경변수:
-  GEMINI_API_KEY   : Google AI Studio API 키 (필수)
-  GEMINI_FLASH_MODEL: Flash 모델명 (기본: gemini-1.5-flash)
-  GEMINI_PRO_MODEL  : Pro 모델명   (기본: gemini-1.5-pro)
+  GEMINI_API_KEY    : Google AI Studio API 키 (필수)
+  GEMINI_FLASH_MODEL: Flash 모델명 (기본: gemini-2.0-flash)
+  GEMINI_PRO_MODEL  : Pro 모델명   (기본: gemini-2.5-pro)
 """
 from __future__ import annotations
 
 import logging
 import os
+import time
 from enum import Enum
 from typing import Optional
 
@@ -79,26 +83,35 @@ _SYSTEM_PROMPT = (
 )
 
 
+# 429 재시도 대기 시간(초) — 순서대로 시도
+_RETRY_DELAYS = [3, 10, 30]
+
+
 def _get_model_name(task: GeminiTask) -> str:
     """태스크에 따라 Flash 또는 Pro 모델명 반환."""
     if task in _PRO_TASKS:
-        return os.getenv("GEMINI_PRO_MODEL", "gemini-1.5-pro")
-    return os.getenv("GEMINI_FLASH_MODEL", "gemini-1.5-flash")
+        return os.getenv("GEMINI_PRO_MODEL", "gemini-2.5-pro")
+    return os.getenv("GEMINI_FLASH_MODEL", "gemini-2.0-flash")
+
+
+# 모듈 레벨 클라이언트 캐시 (API 키당 1회 초기화)
+_CLIENT_CACHE: dict = {}
 
 
 def _get_client():
-    """google-generativeai 클라이언트 초기화 (지연 로딩)."""
+    """google.genai 클라이언트 반환 (지연 로딩 + 캐시)."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("GEMINI_API_KEY 환경변수가 설정되지 않았습니다.")
-    try:
-        import google.generativeai as genai  # type: ignore
-        genai.configure(api_key=api_key)
-        return genai
-    except ImportError:
-        raise ImportError(
-            "google-generativeai 패키지가 필요합니다: pip install google-generativeai"
-        )
+    if api_key not in _CLIENT_CACHE:
+        try:
+            from google import genai  # type: ignore
+            _CLIENT_CACHE[api_key] = genai.Client(api_key=api_key)
+        except ImportError:
+            raise ImportError(
+                "google-genai 패키지가 필요합니다: pip install google-genai"
+            )
+    return _CLIENT_CACHE[api_key]
 
 
 def call_gemini(
@@ -126,30 +139,47 @@ def call_gemini(
 
     logging.info("[gemini] 호출: %s (%s) task=%s", model_name, tier, task.value)
 
-    try:
-        genai = _get_client()
+    # 사용자 메시지: 컨텍스트 + 실제 프롬프트
+    user_content = prompt
+    if context:
+        user_content = f"[현재 컨텍스트]\n{context}\n\n{prompt}"
 
-        # system_instruction 분리 — 역할 준수율 향상
-        model = genai.GenerativeModel(
-            model_name         = model_name,
-            system_instruction = _SYSTEM_PROMPT,
-            generation_config  = {
-                "temperature":       temperature,
-                "max_output_tokens": max_tokens,
-            },
-        )
+    last_exc: Optional[Exception] = None
+    for attempt, delay in enumerate(_RETRY_DELAYS + [None]):
+        try:
+            client = _get_client()
+            from google.genai import types  # type: ignore
 
-        # 사용자 메시지: 컨텍스트 + 실제 프롬프트
-        user_content = prompt
-        if context:
-            user_content = f"[현재 컨텍스트]\n{context}\n\n{prompt}"
+            response = client.models.generate_content(
+                model    = model_name,
+                contents = user_content,
+                config   = types.GenerateContentConfig(
+                    system_instruction = _SYSTEM_PROMPT,
+                    temperature        = temperature,
+                    max_output_tokens  = max_tokens,
+                ),
+            )
+            return response.text.strip() if response.text else None
 
-        response = model.generate_content(user_content)
-        return response.text.strip() if response.text else None
+        except Exception as exc:
+            last_exc = exc
+            err_str  = str(exc)
+            is_rate_limit = "429" in err_str or "RESOURCE_EXHAUSTED" in err_str.upper()
 
-    except Exception as exc:
-        logging.warning("[gemini] 호출 실패 (%s): %s", tier, exc)
-        return None
+            if is_rate_limit and delay is not None:
+                logging.warning(
+                    "[gemini] 429 Rate limit — %ds 후 재시도 (%d/%d)",
+                    delay, attempt + 1, len(_RETRY_DELAYS),
+                )
+                time.sleep(delay)
+                continue
+
+            # 재시도 불가 에러이거나 재시도 소진
+            logging.warning("[gemini] 호출 실패 (%s): %s", tier, exc)
+            return None
+
+    logging.warning("[gemini] 최대 재시도 소진: %s", last_exc)
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -304,6 +334,19 @@ def resolve_signal_conflict(
         prompt, task=GeminiTask.CONFLICT_SIGNALS,
         temperature=0.1, max_tokens=300
     )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 텔레그램 /ask 명령 전용 단순 인터페이스
+# ─────────────────────────────────────────────────────────────────────
+
+def ask_gpt(prompt: str, max_tokens: int = 256) -> str:
+    """
+    자유 형식 질문 → Gemini Flash 응답 (telegram_bot.py /ask 명령 전용).
+    실패 시 오류 메시지 문자열 반환 (예외 전파 없음).
+    """
+    result = call_gemini(prompt, task=GeminiTask.STOCK_ANALYSIS, max_tokens=max_tokens)
+    return result or "응답 없음 (Gemini 오류)"
 
 
 def suggest_strategy_update(

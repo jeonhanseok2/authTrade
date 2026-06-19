@@ -49,7 +49,7 @@ _B4O_STEP1_AT      = 1.00             # +100% → 플로어 +70%
 _B4O_STEP1_FLOOR   = 0.70
 _B4O_STEP2_AT      = 2.00             # +200% → 플로어 +150%
 _B4O_STEP2_FLOOR   = 1.50
-_B4O_CAPITAL       = 0.50             # 예수금 50% 사용
+_B4O_CAPITAL       = 0.30             # 예수금 30% 사용 (버킷과 자금 중복 방지)
 _B4O_RVOL_MIN      = 2.50             # 기초자산 RVOL ≥ 250%
 _B4O_ENTRY_H       = 10               # 10:00 ET 이후 진입
 _B4O_ENTRY_M       = 0
@@ -386,6 +386,8 @@ async def run_b4_sniper_mode(
     _vol_ts = 0.0
     _vix_cache: dict = {}
 
+    _FETCH_TIMEOUT = 20.0   # 개별 외부 I/O 타임아웃(초)
+
     # ── 1. VIX 필터 (5분 캐시) ──────────────────────────────────────
     async def _vix_ok() -> bool:
         """VIX 전일 대비 하락/보합 여부. 데이터 실패 시 진입 허용."""
@@ -394,39 +396,58 @@ async def run_b4_sniper_mode(
             return _vix_cache.get("last", 0) <= _vix_cache.get("prev", float("inf"))
         try:
             import yfinance as yf
-            df = await asyncio.to_thread(
-                yf.download, "^VIX", period="5d", interval="1d",
-                progress=False, auto_adjust=True,
+            df = await asyncio.wait_for(
+                asyncio.to_thread(
+                    yf.download, "^VIX", period="5d", interval="1d",
+                    progress=False, auto_adjust=True,
+                ),
+                timeout=_FETCH_TIMEOUT,
             )
             if df is not None and len(df) >= 2:
-                prev = float(df["Close"].iloc[-2])
-                last = float(df["Close"].iloc[-1])
+                close_arr = df["Close"].to_numpy().flatten()
+                prev = float(close_arr[-2])
+                last = float(close_arr[-1])
                 _vix_cache.update({"prev": prev, "last": last, "ts": now_m})
                 ok = last <= prev
-                logging.debug("[B4] VIX 전일%.2f → 현재%.2f → %s",
-                              prev, last, "롱허용" if ok else "롱차단")
+                logging.info("[B4] VIX 전일%.2f → 현재%.2f → %s",
+                             prev, last, "롱허용" if ok else "롱차단")
                 return ok
+        except asyncio.TimeoutError:
+            logging.warning("[B4] VIX 조회 타임아웃(%ds) — 허용(방어)", int(_FETCH_TIMEOUT))
         except Exception as exc:
-            logging.debug("[B4] VIX 조회 실패: %s — 허용(방어)", exc)
+            logging.warning("[B4] VIX 조회 실패: %s — 허용(방어)", exc)
         return True
 
     # ── 2. 기초자산 평균 5분봉 거래량 갱신 (1시간마다) ──────────────
     async def _refresh_avg_vols() -> None:
+        logging.info("[B4] 평균 거래량 갱신 시작 — %s", _B4_OPT_UNIVERSE)
         for sym in _B4_OPT_UNIVERSE:
             try:
-                df = await asyncio.to_thread(fetch_bars, sym, "5Min", 20 * 78)
+                df = await asyncio.wait_for(
+                    asyncio.to_thread(fetch_bars, sym, "5Min", 20 * 78),
+                    timeout=_FETCH_TIMEOUT,
+                )
                 if df is not None and not df.empty:
                     avg_vols[sym] = float(df["volume"].mean())
-                    logging.debug("[B4] %s 평균5분봉거래량=%.0f", sym, avg_vols[sym])
+                    logging.info("[B4] %s 평균5분봉거래량=%.0f", sym, avg_vols[sym])
+                else:
+                    logging.warning("[B4] %s 거래량 데이터 없음 (장 외 또는 API 미응답)", sym)
+            except asyncio.TimeoutError:
+                logging.warning("[B4] %s 거래량 갱신 타임아웃(%ds)", sym, int(_FETCH_TIMEOUT))
             except Exception as exc:
-                logging.debug("[B4] %s 거래량 갱신 실패: %s", sym, exc)
+                logging.warning("[B4] %s 거래량 갱신 실패: %s", sym, exc)
 
     # ── 3. 기초자산 현재가 (최신 1분봉 종가) ────────────────────────
     async def _spot_price(underlying: str) -> float:
         try:
-            df = await asyncio.to_thread(fetch_bars, underlying, "1Min", 2)
+            df = await asyncio.wait_for(
+                asyncio.to_thread(fetch_bars, underlying, "1Min", 2),
+                timeout=_FETCH_TIMEOUT,
+            )
             if df is not None and not df.empty:
                 return float(df["close"].iloc[-1])
+        except asyncio.TimeoutError:
+            logging.warning("[B4] %s 현재가 조회 타임아웃", underlying)
         except Exception:
             pass
         return 0.0
@@ -434,9 +455,14 @@ async def run_b4_sniper_mode(
     # ── 4. 기초자산 현재 5분봉 거래량 ───────────────────────────────
     async def _cur_5min_vol(underlying: str) -> float:
         try:
-            df = await asyncio.to_thread(fetch_bars, underlying, "5Min", 2)
+            df = await asyncio.wait_for(
+                asyncio.to_thread(fetch_bars, underlying, "5Min", 2),
+                timeout=_FETCH_TIMEOUT,
+            )
             if df is not None and not df.empty:
                 return float(df["volume"].iloc[-1])
+        except asyncio.TimeoutError:
+            logging.warning("[B4] %s 5분봉거래량 조회 타임아웃", underlying)
         except Exception:
             pass
         return 0.0
@@ -728,6 +754,12 @@ async def run_b4_sniper_mode(
             # [포지션 없음] 진입 스캔 — 10초 주기
             # ─────────────────────────────────────────────────────
 
+            # B4 활성화 여부 (텔레그램 /set_b4 off 로 런타임 차단 가능)
+            if dbm.get_system_state("B4_ENABLED", "on") != "on":
+                logging.debug("[B4] 비활성 상태 — 스캔 스킵")
+                await asyncio.sleep(_B4O_SCAN_S)
+                continue
+
             # 쿨다운 체크
             if await asyncio.to_thread(dbm.is_b4_cooldown_active):
                 logging.debug("[B4] 쿨다운 중 — 스캔 스킵")
@@ -747,11 +779,16 @@ async def run_b4_sniper_mode(
 
             # VIX 필터
             if not await _vix_ok():
-                logging.debug("[B4] VIX 필터 차단 — 진입 스킵")
+                logging.info("[B4] VIX 필터 차단 — 진입 스킵")
                 await asyncio.sleep(_B4O_SCAN_S)
                 continue
 
             # 기초자산별 스캔
+            if not any(avg_vols.get(u, 0) > 0 for u in _B4_OPT_UNIVERSE):
+                logging.info("[B4] 평균 거래량 미준비 — 스캔 스킵 (장 외 또는 초기화 중)")
+                await asyncio.sleep(_B4O_SCAN_S)
+                continue
+
             for underlying in _B4_OPT_UNIVERSE:
                 avg_v = avg_vols.get(underlying, 0)
                 if avg_v <= 0:
@@ -782,7 +819,7 @@ async def run_b4_sniper_mode(
                     logging.warning("[B4] %s 프리미엄 조회 실패 — 스킵", opt_sym)
                     continue
 
-                # 예수금 50% → 계약 수 산출 (1계약 = 프리미엄 × 100)
+                # 예수금 × B4_CAPITAL% → 계약 수 산출 (1계약 = 프리미엄 × 100)
                 try:
                     settled = await asyncio.to_thread(broker.get_settled_cash)
                 except Exception:
@@ -793,7 +830,12 @@ async def run_b4_sniper_mode(
                         logging.warning("[B4] 예수금 조회 실패 — 스킵")
                         continue
 
-                budget = settled * _B4O_CAPITAL
+                try:
+                    _cap = float(dbm.get_system_state("B4_CAPITAL", str(_B4O_CAPITAL)))
+                    _cap = max(0.05, min(0.80, _cap))   # 5%~80% 범위 강제
+                except Exception:
+                    _cap = _B4O_CAPITAL
+                budget = settled * _cap
                 qty    = int(budget // (premium * 100))
                 if qty <= 0:
                     logging.info(

@@ -102,7 +102,9 @@ def _init_toss(mode: str):
 
 
 async def main() -> None:
-    load_dotenv()
+    load_dotenv()                            # .env (공통 기본값)
+    from config import load_mode_env
+    load_mode_env()                          # .env.paper 또는 .env.live (MODE 기반)
     setup_logging()
 
     cfg    = load_cfg()

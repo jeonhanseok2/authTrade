@@ -6,7 +6,7 @@ python-dotenv==1.0.1
 PyYAML==6.0.2
 pytz==2024.1
 pydantic-settings>=2.4.0
-google-generativeai>=0.7.0
+google-genai>=1.0.0
 pytest>=8.0
 pytest-mock>=3.12
 # 스크래핑 (Finviz 파싱용)

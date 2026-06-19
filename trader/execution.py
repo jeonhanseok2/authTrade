@@ -8,10 +8,37 @@ class AlpacaBroker:
 
     def get_account(self):
         a = self.client.get_account()
-        return {
+        result = {
             "cash":            float(a.cash),
             "portfolio_value": float(a.portfolio_value),
         }
+        try:
+            equity      = float(a.equity)
+            last_equity = float(a.last_equity)
+            result["equity"]      = equity
+            result["last_equity"] = last_equity
+            result["day_pl"]      = equity - last_equity
+            result["day_pl_pct"]  = (equity - last_equity) / last_equity * 100 if last_equity else 0.0
+        except Exception:
+            pass
+        return result
+
+    def list_positions_detail(self) -> list:
+        out = []
+        for p in self.client.get_all_positions():
+            try:
+                out.append({
+                    "symbol":        p.symbol,
+                    "qty":           float(p.qty),
+                    "avg_entry":     float(p.avg_entry_price),
+                    "current_price": float(p.current_price),
+                    "market_value":  float(p.market_value),
+                    "unrealized_pl": float(p.unrealized_pl),
+                    "unrealized_pct": float(p.unrealized_plpc) * 100,
+                })
+            except Exception:
+                out.append({"symbol": p.symbol, "qty": float(p.qty)})
+        return out
 
     def get_settled_cash(self) -> float:
         """

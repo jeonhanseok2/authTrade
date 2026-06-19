@@ -148,6 +148,7 @@ BOT_COMMANDS = [
     {"command": "ping",       "description": "봇 상태 확인"},
     {"command": "status",     "description": "현재 모드·그룹·오늘 성적·보유 종목 요약"},
     {"command": "set_mode",   "description": "모드 강제 전환 (예: /set_mode B3 또는 B2)"},
+    {"command": "set_b4",     "description": "B4 스나이퍼 설정 (예: /set_b4 on|off|30|50)"},
     {"command": "account",    "description": "계좌 잔고 조회"},
     {"command": "positions",  "description": "보유 포지션 + 진입가 + 고점"},
     {"command": "journal",    "description": "일일 매매 일지 (날짜 미입력 시 오늘)"},
@@ -260,23 +261,76 @@ def quick_scan(data_client, symbols: List[str], minutes: int, cfg: Dict):
     return momentum[:5], value_list[:10]
 
 
-def fmt_positions(db: Optional["PositionDB"], broker_positions: Dict) -> str:
-    """DB 포지션 우선, 없으면 브로커 포지션 표시."""
+_STRATEGY_KR = {
+    "B1_VALUE":      "B1 가치주",
+    "B2_SWING":      "B2 스윙",
+    "B3_AGGRESSIVE": "B3 급등주",
+    "B4":            "B4 변동성",
+    "momentum":      "모멘텀",
+    "value":         "가치주",
+}
+
+_SEP = "─" * 22
+
+
+def _strategy_label(strategy: str) -> str:
+    return _STRATEGY_KR.get(strategy, strategy)
+
+
+def fmt_positions(db: Optional["PositionDB"], broker_detail: list) -> str:
+    """포지션을 한글로 보기좋게 포맷. broker_detail은 list_positions_detail() 결과."""
+    # DB 포지션 → strategy 이름 맵
+    db_map: Dict[str, dict] = {}
     if db:
-        rows = db.list_open_positions()
-        if rows:
-            lines = []
-            for r in rows:
-                lines.append(
-                    f"- {r['symbol']}: {r['qty']}주  "
-                    f"진입가={r['entry_price']:.2f}  "
-                    f"고점={r['peak_price']:.2f}  "
-                    f"[{r['strategy']}]"
-                )
-            return "\n".join(lines)
-    if not broker_positions:
-        return "포지션 없음"
-    return "\n".join(f"- {sym}: {qty}" for sym, qty in broker_positions.items())
+        for r in (db.list_open_positions() or []):
+            db_map[r["symbol"]] = r
+
+    if not broker_detail and not db_map:
+        return "💼 보유 포지션 없음"
+
+    # broker_detail 없으면 DB 전용 표시
+    items = broker_detail if broker_detail else [
+        {"symbol": r["symbol"], "qty": r["qty"]} for r in db_map.values()
+    ]
+
+    lines = [f"💼 <b>보유 포지션 ({len(items)}종목)</b>"]
+    for i, p in enumerate(items, 1):
+        sym = p["symbol"]
+        qty = int(p.get("qty", 0))
+        db_row = db_map.get(sym, {})
+        strategy = db_row.get("strategy", "")
+        label    = _strategy_label(strategy)
+
+        header = f"<b>{'①②③④⑤⑥⑦⑧⑨⑩'[i-1] if i <= 10 else str(i)} {sym}</b>"
+        if label:
+            header += f"  [{label}]"
+        lines.append(_SEP)
+        lines.append(header)
+
+        entry = p.get("avg_entry") or db_row.get("entry_price")
+        cur   = p.get("current_price")
+        upl   = p.get("unrealized_pl")
+        upct  = p.get("unrealized_pct")
+
+        lines.append(f"  수량:    {qty:,}주")
+        if entry:
+            lines.append(f"  진입가:  ${entry:,.2f}")
+        if cur:
+            if entry and entry > 0:
+                arrow = "▲" if cur >= entry else "▼"
+                diff_pct = (cur - entry) / entry * 100
+                lines.append(f"  현재가:  ${cur:,.2f}  {arrow}{diff_pct:+.1f}%")
+            else:
+                lines.append(f"  현재가:  ${cur:,.2f}")
+        if upl is not None:
+            sign = "+" if upl >= 0 else ""
+            pct_str = f" ({upct:+.1f}%)" if upct is not None else ""
+            lines.append(f"  미실현:  {sign}${upl:,.0f}{pct_str}")
+        if not cur and db_row.get("peak_price"):
+            lines.append(f"  고점가:  ${db_row['peak_price']:,.2f}")
+
+    lines.append(_SEP)
+    return "\n".join(lines)
 
 
 # ── 제어 / 보안 ───────────────────────────────────────────────────────
@@ -395,6 +449,8 @@ def main():
                     cur_mode  = dbm.get_system_state("CURRENT_MODE", "알 수 없음")
                     cur_group = dbm.get_system_state("ACTIVE_GROUP",  "알 수 없음")
                     b2_alloc  = dbm.get_system_state("B2_ALLOC_MODE", "-")
+                    b4_en     = dbm.get_system_state("B4_ENABLED",    "on")
+                    b4_cap    = float(dbm.get_system_state("B4_CAPITAL", "0.30"))
 
                     # 오늘 매매 성적
                     trades_today = dbm.get_trades_today()
@@ -415,15 +471,19 @@ def main():
                     if cur_mode == "B2_SWING":
                         mode_line += f"  (내부: {b2_alloc})"
 
+                    b4_line = f"{'✅ ON' if b4_en == 'on' else '🔴 OFF'}  ({b4_cap*100:.0f}%)"
                     msg = (
-                        "📊 <b>봇 상태 요약</b>\n"
-                        f"현재 모드: {mode_line}\n"
-                        f"활성 그룹: <b>{cur_group}</b>\n"
-                        "\n"
-                        f"📈 오늘 매매 ({len(closed)}건)\n"
-                        f"  수익 {wins}건 / 손실 {losses}건 / 누계 {pnl_str}\n"
-                        "\n"
-                        f"💼 보유 종목: {holding_str}"
+                        f"📊 <b>봇 상태 요약</b>\n"
+                        f"{_SEP}\n"
+                        f"모드:      {mode_line}\n"
+                        f"그룹:      <b>{cur_group}</b>\n"
+                        f"B4 스나이퍼: {b4_line}\n"
+                        f"{_SEP}\n"
+                        f"📈 오늘 매매\n"
+                        f"  체결: {len(closed)}건  (수익 {wins} / 손실 {losses})\n"
+                        f"  누계: {pnl_str}\n"
+                        f"{_SEP}\n"
+                        f"💼 보유: {holding_str}"
                     )
                     tg_send(bot_token, chat_id, msg)
                 except Exception as e:
@@ -431,28 +491,156 @@ def main():
                 continue
 
             if cmd == "/set_mode":
-                if not rest:
-                    tg_send(bot_token, chat_id, "형식: /set_mode B3  또는  /set_mode B2")
-                    continue
-                new_mode_str = rest[0].upper()
-                mode_map = {
-                    "B3": "B3_AGGRESSIVE",
-                    "B2": "B2_SWING",
-                    "B3_AGGRESSIVE": "B3_AGGRESSIVE",
-                    "B2_SWING":      "B2_SWING",
+                _mode_map = {
+                    "B3": "B3_AGGRESSIVE", "B3_AGGRESSIVE": "B3_AGGRESSIVE",
+                    "B2": "B2_SWING",      "B2_SWING":      "B2_SWING",
                 }
-                if new_mode_str not in mode_map:
-                    tg_send(bot_token, chat_id, "유효한 모드: B3, B2")
+                _mode_labels = {"B3_AGGRESSIVE": "B3 급등주", "B2_SWING": "B2 스윙"}
+
+                # ── 인수 없음: 현재 상태 + 예산 표시 ─────────────────
+                if not rest:
+                    try:
+                        cur = dbm.get_system_state("CURRENT_MODE", "B3_AGGRESSIVE")
+                        locked = dbm.get_system_state("MODE_LOCKED", "off") == "on"
+                        lock_str = "🔒 고정됨 (프리마켓 스캔 무시)" if locked else "🔓 자동 (프리마켓 스캔이 결정)"
+
+                        # 계좌 + 예산 조회
+                        try:
+                            acct    = broker.get_account()
+                            equity  = acct.get("equity", acct.get("portfolio_value", 0))
+                            cash    = acct.get("cash", 0)
+                            b3_budget = equity * 0.50
+                            b2_budget = equity * 0.40
+                            b1_budget = equity * 0.10
+                            budget_lines = (
+                                f"  B3 급등주:  ${b3_budget:>10,.0f}  (50%)\n"
+                                f"  B2 스윙:    ${b2_budget:>10,.0f}  (40%)\n"
+                                f"  B1 가치주:  ${b1_budget:>10,.0f}  (10%)\n"
+                                f"  현금:       ${cash:>10,.0f}"
+                            )
+                        except Exception:
+                            budget_lines = "  (계좌 조회 실패)"
+
+                        tg_send(bot_token, chat_id,
+                            f"⚙️ <b>모드 설정</b>\n"
+                            f"{_SEP}\n"
+                            f"현재 모드: <b>{_mode_labels.get(cur, cur)}</b>\n"
+                            f"잠금:      {lock_str}\n"
+                            f"{_SEP}\n"
+                            f"<b>예산 현황</b> (총 ${equity:,.0f})\n"
+                            f"{budget_lines}\n"
+                            f"{_SEP}\n"
+                            f"변경 명령:\n"
+                            f"  /set_mode B3       — B3 전환 (자동복원 가능)\n"
+                            f"  /set_mode B2       — B2 전환 (자동복원 가능)\n"
+                            f"  /set_mode B3 lock  — B3 전환 + 고정\n"
+                            f"  /set_mode B2 lock  — B2 전환 + 고정\n"
+                            f"  /set_mode auto     — 고정 해제 (프리마켓 자동)"
+                        )
+                    except Exception as e:
+                        tg_send(bot_token, chat_id, f"모드 조회 오류: {e}")
                     continue
-                canonical = mode_map[new_mode_str]
-                try:
-                    dbm.update_system_state("CURRENT_MODE", canonical)
-                    logging.warning("[TG] /set_mode: %s → %s (by %s)", cur_mode if 'cur_mode' in dir() else '?', canonical, user)
+
+                new_mode_str = rest[0].upper()
+
+                # ── auto / unlock: 고정 해제 ──────────────────────────
+                if new_mode_str in ("AUTO", "UNLOCK"):
+                    try:
+                        dbm.update_system_state("MODE_LOCKED", "off")
+                        cur = dbm.get_system_state("CURRENT_MODE", "B3_AGGRESSIVE")
+                        tg_send(bot_token, chat_id,
+                                f"🔓 모드 고정 해제\n"
+                                f"현재 모드: <b>{_mode_labels.get(cur, cur)}</b>\n"
+                                f"다음 프리마켓 스캔(9:40 ET)에서 자동 결정됩니다.")
+                    except Exception as e:
+                        tg_send(bot_token, chat_id, f"해제 오류: {e}")
+                    continue
+
+                # ── B3 / B2 [lock] ────────────────────────────────────
+                if new_mode_str not in _mode_map:
                     tg_send(bot_token, chat_id,
-                            f"✅ 모드 강제 전환: <b>{canonical}</b>\n"
-                            f"⚠️ 다음 프리마켓 스캔(9:20 ET) 전까지 이 모드가 유지됩니다.")
+                            "사용법:\n"
+                            "  /set_mode B3 [lock]\n"
+                            "  /set_mode B2 [lock]\n"
+                            "  /set_mode auto")
+                    continue
+
+                canonical = _mode_map[new_mode_str]
+                do_lock   = len(rest) >= 2 and rest[1].lower() == "lock"
+
+                # 가용 자금 체크 (전환 가능 여부)
+                feasible = True
+                try:
+                    acct   = broker.get_account()
+                    equity = acct.get("equity", acct.get("portfolio_value", 0))
+                    cash   = acct.get("cash", 0)
+                    min_required = equity * (0.50 if canonical == "B3_AGGRESSIVE" else 0.40)
+                    if cash < min_required * 0.3:
+                        feasible = False
+                except Exception:
+                    equity = cash = 0
+
+                try:
+                    prev_mode = dbm.get_system_state("CURRENT_MODE", "?")
+                    dbm.update_system_state("CURRENT_MODE", canonical)
+                    dbm.update_system_state("MODE_LOCKED", "on" if do_lock else "off")
+                    logging.warning("[TG] /set_mode: %s → %s lock=%s (by %s)",
+                                    prev_mode, canonical, do_lock, user)
+
+                    lock_note = "🔒 프리마켓 스캔 고정" if do_lock else "🔓 다음 프리마켓 스캔에 자동 복원 가능"
+                    warn = ""
+                    if not feasible:
+                        warn = f"\n⚠️ 현금(${cash:,.0f})이 권장 예산(${min_required:,.0f})보다 낮습니다."
+
+                    tg_send(bot_token, chat_id,
+                            f"✅ 모드 전환: <b>{_mode_labels.get(canonical, canonical)}</b>\n"
+                            f"{lock_note}\n"
+                            f"총 자산: ${equity:,.0f} | 현금: ${cash:,.0f}"
+                            f"{warn}")
                 except Exception as e:
                     tg_send(bot_token, chat_id, f"모드 전환 오류: {e}")
+                continue
+
+            if cmd == "/set_b4":
+                arg = rest[0].lower() if rest else ""
+                try:
+                    if arg == "on":
+                        dbm.update_system_state("B4_ENABLED", "on")
+                        cap = float(dbm.get_system_state("B4_CAPITAL", "0.30"))
+                        tg_send(bot_token, chat_id,
+                                f"✅ B4 스나이퍼 <b>활성화</b> (자금 {cap*100:.0f}%)\n"
+                                f"다음 스캔 주기부터 적용됩니다.")
+                    elif arg == "off":
+                        dbm.update_system_state("B4_ENABLED", "off")
+                        tg_send(bot_token, chat_id,
+                                "🔴 B4 스나이퍼 <b>비활성화</b>\n"
+                                "현재 포지션은 청산 로직이 계속 동작합니다.")
+                    elif arg.isdigit() or (arg.replace(".", "", 1).isdigit()):
+                        pct = float(arg)
+                        if not 5 <= pct <= 80:
+                            tg_send(bot_token, chat_id, "자금 비율은 5~80 사이로 입력하세요 (예: /set_b4 30)")
+                        else:
+                            dbm.update_system_state("B4_CAPITAL", str(pct / 100))
+                            enabled = dbm.get_system_state("B4_ENABLED", "on")
+                            tg_send(bot_token, chat_id,
+                                    f"✅ B4 자금 비율 → <b>{pct:.0f}%</b>  (상태: {'ON' if enabled == 'on' else 'OFF'})\n"
+                                    f"다음 진입 시 적용됩니다.")
+                    else:
+                        cur_en  = dbm.get_system_state("B4_ENABLED", "on")
+                        cur_cap = float(dbm.get_system_state("B4_CAPITAL", "0.30"))
+                        tg_send(bot_token, chat_id,
+                                f"🎯 B4 스나이퍼 현재 설정\n"
+                                f"{_SEP}\n"
+                                f"상태:      {'✅ ON' if cur_en == 'on' else '🔴 OFF'}\n"
+                                f"자금 비율: {cur_cap*100:.0f}%\n"
+                                f"{_SEP}\n"
+                                f"변경 명령:\n"
+                                f"  /set_b4 on   — 활성화\n"
+                                f"  /set_b4 off  — 비활성화\n"
+                                f"  /set_b4 30   — 자금 30%\n"
+                                f"  /set_b4 50   — 자금 50%")
+                except Exception as e:
+                    tg_send(bot_token, chat_id, f"B4 설정 오류: {e}")
                 continue
 
             if cmd in ("/start", "/help"):
@@ -462,6 +650,7 @@ def main():
                         "/ping — 봇 상태 확인\n"
                         "/status — 모드·그룹·오늘 성적·보유 종목\n"
                         "/set_mode [B3/B2] — 모드 강제 전환\n"
+                        "/set_b4 [on/off/30] — B4 스나이퍼 설정\n"
                         "/account — 계좌 잔고\n"
                         "/positions — 포지션 + 진입가 + 고점\n"
                         "\n<b>분석 · 일지</b>\n"
@@ -516,9 +705,27 @@ def main():
 
             if cmd == "/account":
                 try:
-                    info = broker.get_account()
-                    tg_send(bot_token, chat_id,
-                            f"📊 Account\ncash: {info.get('cash')}\nportfolio_value: {info.get('portfolio_value')}")
+                    info  = broker.get_account()
+                    cash  = info.get("cash", 0.0)
+                    pv    = info.get("portfolio_value", 0.0)
+                    eq    = info.get("equity", pv)
+                    dpl   = info.get("day_pl")
+                    dpct  = info.get("day_pl_pct")
+
+                    acct_mode = "PAPER" if mode == "paper" else "LIVE"
+                    lines = [
+                        f"💰 <b>계좌 현황</b>  ({acct_mode})",
+                        _SEP,
+                        f"총 자산:     ${eq:>12,.2f}",
+                        f"현금:        ${cash:>12,.2f}",
+                        f"포트폴리오:  ${pv:>12,.2f}",
+                    ]
+                    if dpl is not None:
+                        sign = "+" if dpl >= 0 else ""
+                        pct_str = f" ({dpct:+.2f}%)" if dpct is not None else ""
+                        lines.append(f"전일 대비:   {sign}${dpl:>11,.2f}{pct_str}")
+                    lines.append(_SEP)
+                    tg_send(bot_token, chat_id, "\n".join(lines))
                 except Exception as e:
                     tg_send(bot_token, chat_id, f"계정 조회 오류: {e}")
                 continue
@@ -542,8 +749,8 @@ def main():
 
             if cmd == "/positions":
                 try:
-                    broker_pos = broker.list_positions()
-                    tg_send(bot_token, chat_id, fmt_positions(db, broker_pos))
+                    detail = broker.list_positions_detail() if hasattr(broker, "list_positions_detail") else []
+                    tg_send(bot_token, chat_id, fmt_positions(db, detail))
                 except Exception as e:
                     tg_send(bot_token, chat_id, f"포지션 조회 오류: {e}")
                 continue

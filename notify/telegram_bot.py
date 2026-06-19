@@ -757,6 +757,24 @@ def main():
 
             if cmd == "/scan":
                 try:
+                    # 미국 장 개장 여부 확인 (공휴일/주말 조기 차단)
+                    _market_closed_msg = None
+                    if trading_client:
+                        try:
+                            _clock = trading_client.get_clock()
+                            if not _clock.is_open:
+                                from zoneinfo import ZoneInfo
+                                _next_open = _clock.next_open.astimezone(ZoneInfo("America/New_York"))
+                                _market_closed_msg = (
+                                    f"미국 시장이 현재 휴장 중입니다.\n"
+                                    f"다음 개장: {_next_open.strftime('%m/%d %H:%M')} ET"
+                                )
+                        except Exception:
+                            pass  # clock 조회 실패 시 스캔 계속 진행
+                    if _market_closed_msg:
+                        tg_send(bot_token, chat_id, _market_closed_msg)
+                        continue
+
                     symbols = get_watchlist(cfg)
                     mom, val = quick_scan(data_client, symbols, args.minutes, cfg)
                     txt = (

@@ -178,9 +178,14 @@ class Orchestrator:
             return None
 
     def _is_tradeable(self) -> bool:
-        """신규 진입 가능 여부 (킬스위치 + 데드존)."""
+        """신규 진입 가능 여부 (킬스위치 + 미국장 시간 + 데드존)."""
         if self.kill_switch.is_killed:
             return False
+        # ── 미국 정규장 외 차단 (9:30~16:00 ET, 주말 포함) ──
+        from strategy.risk import within_trade_window
+        if not within_trade_window(datetime.now(timezone.utc), start_after_min=0, end_before_min=0):
+            return False
+        # ── 데드존 (11:30~13:00 ET) ──
         dz = self.cfg.get("engine", {}).get("deadzone", {})
         if dz.get("enabled", True):
             from strategy.regime import is_deadzone
@@ -596,6 +601,36 @@ class Orchestrator:
         _journal_done_date: str = ""  # 하루 한 번만 생성
         while True:
             try:
+                # ── 장 상태 heartbeat (60초마다) ──────────────────────
+                from zoneinfo import ZoneInfo as _ZI
+                _now_et = datetime.now(_ZI("America/New_York"))
+                _open   = _now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
+                _close  = _now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
+                if _now_et.weekday() >= 5:
+                    logging.info("[MONITOR] 주말 — 장 닫힘 (다음 월요일 09:30 ET 대기)")
+                elif _now_et < _open:
+                    _diff = _open - _now_et
+                    _h, _rem = divmod(int(_diff.total_seconds()), 3600)
+                    _m = _rem // 60
+                    logging.info("[MONITOR] 장 개장까지 %d시간 %d분 (09:30 ET)", _h, _m)
+                elif _now_et > _close:
+                    logging.info("[MONITOR] 장 마감 — 다음 개장 대기")
+                else:
+                    logging.info("[MONITOR] 장중 (ET %s) | 킬스위치=%s",
+                                 _now_et.strftime("%H:%M"), self.kill_switch.is_killed)
+
+                # 텔레그램 수동 모드 변경 감지 — DB vs 런타임 불일치 시 즉시 적용
+                _db_mode_str = dbm.get_system_state("CURRENT_MODE")
+                if _db_mode_str:
+                    try:
+                        from core.regime_engine import MarketMode as _MM
+                        _db_mode = _MM(_db_mode_str)
+                        if _db_mode != self.strategy_mgr.current_mode:
+                            self.strategy_mgr._analyzer._regime._mode = _db_mode
+                            logging.info("[MONITOR] 수동 모드 적용: %s", _db_mode_str)
+                    except (ValueError, AttributeError):
+                        pass
+
                 await self._monitor_cycle()
                 tick += 1
                 # 60틱(60분)마다 성과 기반 리밸런싱
@@ -747,9 +782,16 @@ class Orchestrator:
         positions = self.db.list_open_positions()
         b1_count  = sum(1 for p in positions if p["strategy"] == "value_long")
         if b1_count >= max_pos:
+            logging.info("[B1] 최대 포지션 도달 (%d/%d) — 스캔 스킵", b1_count, max_pos)
             return
 
+        logging.info("[B1] 스캔 시작 — %d종목 검색 (레짐: %s, VIX: %.1f, B1보유: %d/%d)",
+                     len(symbols), r_str, vix or 0, b1_count, max_pos)
         candidates = scan_value_candidates(symbols, min_score=float(cfg_b1.get("min_fund_score", 55.0)))
+        if not candidates:
+            logging.info("[B1] 적격 후보 없음 (기준 점수: %.0f점)", float(cfg_b1.get("min_fund_score", 55.0)))
+            return
+        logging.info("[B1] 후보 %d종목: %s", len(candidates), [s for s, _ in candidates[:10]])
         per_pos_budget = budget / max_pos
 
         for sym, fs in candidates:
@@ -767,6 +809,7 @@ class Orchestrator:
                 min_safety_margin=float(cfg_b1.get("min_safety_margin_pct", 10.0)),
             )
             if not ok:
+                logging.info("[B1] %s 진입 조건 미충족: %s", sym, reason)
                 continue
 
             last = self._fetch_last(sym)
@@ -853,6 +896,8 @@ class Orchestrator:
         target  = self.strategy_mgr.rebalance_b2()
         budget  = self.account_mgr.capital_b2()
         cfg_b2  = self.cfg.get("etf_swing", {})
+        logging.info("[B2] 리밸런싱 → 모드: %s | 목표 종목: %s | 예산: $%.0f",
+                     target.mode.name, target.symbols or "없음", budget)
 
         # ── CASH 모드: 모든 B2 포지션 청산 ─────────────────────────
         if target.mode == B2AllocMode.CASH:
@@ -891,7 +936,7 @@ class Orchestrator:
             # B2 전용 MA20+RSI30 진입 판단 (3분룰 없음)
             ok, reason, trailing_stop = swing_b2_entry(sym, df)
             if not ok:
-                logging.debug("[B2-Alloc] %s 진입 조건 미충족: %s", sym, reason)
+                logging.info("[B2-Alloc] %s 진입 조건 미충족: %s", sym, reason)
                 continue
 
             last = self._fetch_last(sym)
@@ -1040,6 +1085,9 @@ class Orchestrator:
         gap_pct, rvol = await asyncio.to_thread(self._get_b3_gap_data, symbol, df)
         candidate = GapCandidate(symbol=symbol, gap_pct=gap_pct, rvol=rvol, atr=0.0, score=50.0)
 
+        logging.info("[B3] %s 바 수신 — gap%.1f%% RVOL%.1fx | 진입 판단 중",
+                     symbol, gap_pct * 100, rvol)
+
         # ── 1차 진입: Gap&Go (첫 5분봉 고점 돌파) ────────────────
         ok, price, stop, reason = await asyncio.to_thread(
             gap_and_go_squeeze_entry, symbol, df, candidate, regime
@@ -1057,6 +1105,7 @@ class Orchestrator:
                 reason = "[2차]" + reason
 
         if not ok:
+            logging.info("[B3] %s 진입 조건 미충족 — %s", symbol, reason)
             return
 
         # ── 스푸핑 블랙리스트 ────────────────────────────────────────

@@ -21,6 +21,7 @@ from typing import Callable, List, Optional
 from core.regime_engine          import MarketMode
 from core.MarketRegimeAnalyzer   import MarketRegimeAnalyzer, ScanResult
 from strategy.b2_allocation      import B2AllocationEngine, B2AllocMode, AllocationTarget
+import storage.db_manager as dbm
 
 
 class StrategyManager:
@@ -147,13 +148,20 @@ class StrategyManager:
                         now_et.weekday() < 5
                         and now_et.hour   == PREMARKET_SCAN_HOUR
                         and now_et.minute == PREMARKET_SCAN_MINUTE
-                        and last_date != _date.today()
+                        and last_date != now_et.date()
                     ):
+                        # MODE_LOCKED: 텔레그램 수동 고정 시 프리마켓 스캔 스킵
+                        if dbm.get_system_state("MODE_LOCKED", "off") == "on":
+                            logging.info("[StrategyManager] 모드 고정(lock) 중 — 프리마켓 스캔 건너뜀")
+                            last_date = now_et.date()
+                            await _asyncio.sleep(30)
+                            continue
+
                         prev_mode = self.current_mode
                         result: ScanResult = await self._analyzer.scan(
                             scan_symbols, df_fetcher, stream_update_fn
                         )
-                        last_date = _date.today()
+                        last_date = now_et.date()
 
                         # 모드 전환 시 자금 재확인 (T+1 Settled Cash 동기화)
                         if result.mode != prev_mode and self._account_mgr and self._broker:

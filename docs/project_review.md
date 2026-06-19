@@ -1,5 +1,5 @@
 # authTrade — 사계절 퀀트 엔진 구조 및 매매 원칙 요약
-> 교차 검증용 문서. 최종 업데이트: 2026-06-17 (B4 스나이퍼 모드 콜옵션 버전 + analyzer.py 반영)
+> 교차 검증용 문서. 최종 업데이트: 2026-06-18 (버그수정 · 로깅 개선 · B4 타임아웃 반영)
 
 ---
 
@@ -365,13 +365,13 @@ Telegram Bot         → 실시간 알림 + 수동 제어
 
 | 경로 | 역할 |
 |------|------|
-| `main.py` | 진입점 + asyncio.gather (7개 태스크) |
-| `core/orchestrator.py` | 비동기 태스크 조율 |
+| `main.py` | 진입점 + asyncio.gather (7개 태스크) · `load_mode_env()` 호출 |
+| `core/orchestrator.py` | 비동기 태스크 조율 · `_is_tradeable()` 장 시간 체크 · B1/B2/B3 스캔 결과 로그 · 60초 heartbeat |
 | `core/MarketRegimeAnalyzer.py` | 시장 상태 진단 (프리마켓 스캔 + 뉴스 보정) |
-| `core/StrategyManager.py` | 전략 전환 엔진 (B3/B2 + sync lock) |
+| `core/StrategyManager.py` | 전략 전환 엔진 (B3/B2 + sync lock) · ET 날짜 기준 중복 스캔 방지 |
 | `core/AccountManager.py` | 계좌 자금 관리 (A/B + Settled Cash) |
 | `core/regime_engine.py` | B3/B2 모드 감지 + 전환 |
-| `strategy/strategy_engine.py` | B1~B3 통합 인터페이스 + **B4 스나이퍼 모드 (콜옵션)** |
+| `strategy/strategy_engine.py` | B1~B3 통합 인터페이스 + **B4 스나이퍼 모드 (콜옵션)** · 외부 I/O 20s 타임아웃 |
 | `strategy/news_analyzer.py` | 뉴스 수집 + Gemini 심리 분석 + 차단 |
 | `strategy/confidence_scanner.py` | RVOL/Alpha/VWAP 100점 스코어러 |
 | `strategy/exit_strategy.py` | 4-레이어 청산 엔진 (개미털기 방어) |
@@ -379,4 +379,6 @@ Telegram Bot         → 실시간 알림 + 수동 제어
 | `storage/db.py` | PositionDB (포지션 저널 — B1/B2/B3) |
 | `storage/db_manager.py` | trades/market_log/system_state/**b4_trades/b4_cooldown** CRUD |
 | **`analyzer.py`** | **페이퍼 데이터 분석 + 파라미터 튜닝 제안 CLI** |
+| `utils/logging.py` | JSON 로거 · UTC 타임스탬프 · `DailyFileHandler` (logs/YYMM/YYYY-MM-DD.log) |
 | `notify/telegram_notifier.py` | 텔레그램 단방향 알림 (`send_telegram(text)`) |
+| `ai/gemini_helper.py` | Gemini Flash/Pro 라우터 · 429 재시도 · `google-genai` SDK |
